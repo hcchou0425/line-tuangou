@@ -28,6 +28,15 @@ LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 DB_PATH = os.environ.get("DB_PATH", "/data/tuangou.db")
 
+# 立即檢查 DB 目錄是否可用，不可用就 fallback 到當前目錄
+_db_dir = os.path.dirname(DB_PATH)
+if _db_dir and not os.path.exists(_db_dir):
+    try:
+        os.makedirs(_db_dir, exist_ok=True)
+    except OSError:
+        DB_PATH = "tuangou.db"
+        logger.warning(f"[startup] /data 不存在，改用當前目錄: {DB_PATH}")
+
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
