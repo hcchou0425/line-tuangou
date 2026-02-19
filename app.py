@@ -183,6 +183,14 @@ def get_item_name(group_buy_id, item_num):
     return row[0] if row else None
 
 
+def extract_price(price_info):
+    """從品項文字中提取單價（取第一個 N元 的 N）"""
+    if not price_info:
+        return None
+    m = re.search(r'(\d+)\s*元', price_info)
+    return int(m.group(1)) if m else None
+
+
 # ══════════════════════════════════════════
 # 通用輔助函式
 # ══════════════════════════════════════════
@@ -362,16 +370,22 @@ def cmd_order(group_id, user_id, user_name, text):
     registered_by = None
 
     if rest:
-        # 嘗試判斷：純數字 → 數量
-        if re.match(r'^\d+$', rest):
-            quantity = int(rest)
+        # 嘗試判斷：純數字 或 數字+單位(份/個/包/組/盒/袋/條) → 數量
+        qty_m = re.match(r'^(\d+)\s*[份個包組盒袋條]?$', rest)
+        if qty_m:
+            quantity = int(qty_m.group(1))
         else:
             # 名字 [數量]
             parts = rest.rsplit(None, 1)
-            if len(parts) == 2 and re.match(r'^\d+$', parts[1]):
-                order_name = parts[0]
-                quantity = int(parts[1])
-                registered_by = user_name
+            if len(parts) == 2:
+                qty_m2 = re.match(r'^(\d+)\s*[份個包組盒袋條]?$', parts[1])
+                if qty_m2:
+                    order_name = parts[0]
+                    quantity = int(qty_m2.group(1))
+                    registered_by = user_name
+                else:
+                    order_name = rest
+                    registered_by = user_name
             else:
                 order_name = rest
                 registered_by = user_name
@@ -527,11 +541,14 @@ def cmd_list(group_id):
 
     lines = [f"🛒 {title}", "────────────────"]
     total_orders = 0
+    total_amount = 0
+    has_price = False
 
     for item in items:
         # item: id, group_buy_id, item_num, name, price_info
         item_num = item[2]
         price_info = item[4] or item[3]
+        unit_price = extract_price(price_info)
 
         # 顯示品項（含完整價格資訊）
         info_lines = price_info.split('\n')
@@ -548,14 +565,23 @@ def cmd_list(group_id):
                 subtotal += qty
                 lines.append(f"   👤 {name} x{qty}")
             total_orders += subtotal
-            lines.append(f"   小計：{subtotal} 份")
+            item_amount_str = ""
+            if unit_price:
+                item_amount = unit_price * subtotal
+                total_amount += item_amount
+                has_price = True
+                item_amount_str = f"　💰{item_amount}元"
+            lines.append(f"   小計：{subtotal} 份{item_amount_str}")
         else:
             lines.append("   （尚無人下單）")
 
         lines.append("")  # 空行分隔
 
     lines.append("────────────────")
-    lines.append(f"共 {total_orders} 份訂單")
+    summary = f"共 {total_orders} 份訂單"
+    if has_price:
+        summary += f"　💰總金額：{total_amount} 元"
+    lines.append(summary)
 
     return '\n'.join(lines)
 
