@@ -194,11 +194,64 @@ def get_item_name(group_buy_id, item_num):
 
 
 def extract_price(price_info):
-    """從品項文字中提取單價（取第一個 N元 的 N）"""
+    """從品項文字中提取單價（取第一個 N元 的 N，供 AI 統計用）"""
     if not price_info:
         return None
     m = re.search(r'(\d+)\s*元', price_info)
     return int(m.group(1)) if m else None
+
+
+def extract_price_tiers(price_info):
+    """從品項文字中提取所有價格階梯 [(quantity, price), ...]
+    例如 '220元／2包420元' → [(1, 220), (2, 420)]
+    """
+    if not price_info:
+        return []
+    tiers = []
+    # 以 ／ 或 / 分段
+    segments = re.split(r'[／/]', price_info)
+    for seg in segments:
+        # 階梯價：段落開頭的 "N包M元" 格式（N >= 2）
+        m = re.match(r'\s*(\d+)\s*[包份組盒袋]\s*(\d+)\s*元', seg)
+        if m and int(m.group(1)) >= 2:
+            tiers.append((int(m.group(1)), int(m.group(2))))
+            continue
+        # 單價：M元
+        m = re.search(r'(\d+)\s*元', seg)
+        if m:
+            price = int(m.group(1))
+            if not any(t[1] == price for t in tiers):
+                tiers.append((1, price))
+    return sorted(tiers, key=lambda t: t[0])
+
+
+def calculate_amount(price_info, quantity):
+    """根據價格階梯計算最佳金額
+    例如 '220元／2包420元', qty=2 → 420（不是 440）
+    """
+    tiers = extract_price_tiers(price_info)
+    if not tiers:
+        return None
+
+    # 貪心法：優先使用大包裝
+    tiers_desc = sorted(tiers, key=lambda t: t[0], reverse=True)
+    remaining = quantity
+    total = 0
+    for tier_qty, tier_price in tiers_desc:
+        if remaining >= tier_qty:
+            count = remaining // tier_qty
+            total += count * tier_price
+            remaining -= count * tier_qty
+    if remaining > 0:
+        # 用單價計算剩餘
+        unit_tier = next((t for t in tiers if t[0] == 1), None)
+        if unit_tier:
+            total += remaining * unit_tier[1]
+        else:
+            # 無單價，用最小階梯的平均價
+            smallest = tiers[0]
+            total += int(remaining * smallest[1] / smallest[0])
+    return total
 
 
 # ══════════════════════════════════════════
@@ -570,7 +623,6 @@ def cmd_list(group_id):
         # item: id, group_buy_id, item_num, name, price_info
         item_num = item[2]
         price_info = item[4] or item[3]
-        unit_price = extract_price(price_info)
 
         # 顯示品項（含完整價格資訊）
         info_lines = price_info.split('\n')
@@ -588,8 +640,8 @@ def cmd_list(group_id):
                 lines.append(f"   👤 {name} x{qty}")
             total_orders += subtotal
             item_amount_str = ""
-            if unit_price:
-                item_amount = unit_price * subtotal
+            item_amount = calculate_amount(price_info, subtotal)
+            if item_amount:
                 total_amount += item_amount
                 has_price = True
                 item_amount_str = f"　💰{item_amount}元"
