@@ -53,11 +53,12 @@ HELP_TEXT = """📖 團購指令說明
 【所有人可用】
 指令　　　　　　　說明
 ──────────────
-+N　　　　　　　 下單品項N（1份）
++N 或 N.　　　　下單品項N（1份）
 +N 數量　　　　　下單品項N指定數量
 +N 名字　　　　　幫人下單1份
 +N 名字 數量　　 幫人下單指定數量
 +N +M +K 名字　 一次下單多品項
+　（N. 格式也通用，如 1. 或 1. 2）
 退出 N　　　　　 取消品項N的訂單
 退出 N 名字　　　取消指定人的訂單
 列表　　　　　　　查看所有下單狀況
@@ -720,6 +721,12 @@ def handle_message(event):
     # ── 單品項下單（+N / +N 數量 / +N 名字 / +N 名字 數量）
     elif re.match(r'\+\d+(\s|$)', text):
         reply = cmd_order(gid, uid, lazy_name(), text)
+
+    # ── 數字點格式下單（1. / 1. 2 / 1. 小明 / 1. 小明 2）
+    elif re.match(r'^\d+[\.．](\s|$)', text):
+        m_dot = re.match(r'^(\d+)[\.．]\s*(.*)', text)
+        rest = m_dot.group(2).strip() if m_dot.group(2) else ""
+        reply = cmd_order(gid, uid, lazy_name(), f"+{m_dot.group(1)} {rest}".strip())
 
     # ── 退出
     elif re.match(r'退出\s+\d+', text):
