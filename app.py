@@ -204,24 +204,29 @@ def extract_price(price_info):
 def extract_price_tiers(price_info):
     """從品項文字中提取所有價格階梯 [(quantity, price), ...]
     例如 '220元／2包420元' → [(1, 220), (2, 420)]
+    例如 '一包 200 元 2包 300 元' → [(1, 200), (2, 300)]
     """
     if not price_info:
         return []
     tiers = []
-    # 以 ／ 或 / 分段
-    segments = re.split(r'[／/]', price_info)
-    for seg in segments:
-        # 階梯價：段落開頭的 "N包M元" 格式（N >= 2）
-        m = re.match(r'\s*(\d+)\s*[包份組盒袋]\s*(\d+)\s*元', seg)
-        if m and int(m.group(1)) >= 2:
-            tiers.append((int(m.group(1)), int(m.group(2))))
-            continue
-        # 單價：M元
-        m = re.search(r'(\d+)\s*元', seg)
-        if m:
-            price = int(m.group(1))
-            if not any(t[1] == price for t in tiers):
+    tier_prices = set()
+
+    # 先掃描整段文字，找出所有 "N包M元" 階梯價（N >= 2）
+    for m in re.finditer(r'(\d+)\s*[包份組盒袋]\s*(\d+)\s*元', price_info):
+        qty = int(m.group(1))
+        price = int(m.group(2))
+        if qty >= 2:
+            tiers.append((qty, price))
+            tier_prices.add(price)
+
+    # 再找所有 "M元" 作為單價候選（排除已被階梯價使用的金額）
+    for m in re.finditer(r'(\d+)\s*元', price_info):
+        price = int(m.group(1))
+        if price not in tier_prices:
+            if not any(t[0] == 1 for t in tiers):
                 tiers.append((1, price))
+            break  # 取第一個作為單價
+
     return sorted(tiers, key=lambda t: t[0])
 
 
