@@ -16,6 +16,7 @@ from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage, JoinEvent
 import pytz
+from anthropic import Anthropic
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -45,6 +46,9 @@ except Exception:
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+claude_client = Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+
 # ── 品項解析正規表示式
 ITEM_NUM_RE = re.compile(r'^\s*[（(]?(\d+)[）)\.\、\)]\s*(.*)')
 
@@ -66,7 +70,12 @@ HELP_TEXT = """📖 團購指令說明
 退出 N 名字　　　取消指定人的訂單
 列表　　　　　　　查看所有下單狀況
 我的訂單　　　　　查看自己的訂單
+統計　　　　　　　AI 智能訂單統計
 團購說明　　　　　顯示本說明
+
+【AI 智能理解】
+直接說想買什麼，AI 會幫你下單
+　（例：「我要水餃兩包」「幫小明訂一份魚頭」）
 
 ━━━━━━━━━━━━━━
 【團主專用】
@@ -667,6 +676,15 @@ def cmd_close(group_id, user_id):
     # 先產生最終列表
     final_list = cmd_list(group_id)
 
+    # AI 結單報告（在 status 更新前呼叫，因為更新後 get_active_buy 就找不到了）
+    ai_report = ""
+    try:
+        ai_summary = cmd_ai_summary(group_id)
+        if ai_summary and not ai_summary.startswith("⚠️"):
+            ai_report = f"\n\n{ai_summary}"
+    except Exception as e:
+        logger.error(f"[close] AI 報告生成失敗: {e}")
+
     # 更新狀態
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -674,7 +692,7 @@ def cmd_close(group_id, user_id):
     conn.commit()
     conn.close()
 
-    return f"🔒 團購已結團！\n\n{final_list}"
+    return f"🔒 團購已結團！\n\n{final_list}{ai_report}"
 
 
 def cmd_cancel_buy(group_id, user_id):
@@ -699,6 +717,244 @@ def cmd_cancel_buy(group_id, user_id):
     conn.close()
 
     return f"🗑️ 團購「{title}」已取消，所有資料已刪除。"
+
+
+# ══════════════════════════════════════════
+# AI 功能（Claude API）
+# ══════════════════════════════════════════
+
+def call_claude(prompt_text):
+    """呼叫 Claude API 進行分析"""
+    if not claude_client:
+        return None
+    try:
+        message = claude_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=2000,
+            system="你是團購統計助理，負責彙整訂單資料。回覆必須簡潔清楚，適合在 LINE 群組中顯示。使用繁體中文。不要使用 markdown 格式（不要用 ** 或 # 等符號）。用 emoji 和分隔線讓報告容易閱讀。",
+            messages=[
+                {"role": "user", "content": prompt_text}
+            ]
+        )
+        return message.content[0].text
+    except Exception as e:
+        logger.error(f"[claude] API 呼叫失敗: {e}")
+        return None
+
+
+def is_possibly_order_related(text, items):
+    """檢查訊息是否可能跟團購下單有關"""
+    # 包含品項名稱中的關鍵字
+    for item in items:
+        item_name = item[3]  # name field
+        if any(keyword in text for keyword in item_name.split() if len(keyword) >= 2):
+            return True
+    # 包含下單相關的詞彙
+    order_keywords = ['要', '買', '訂', '加', '來', '份', '個', '包', '組', '盒',
+                      '幫我', '我也', '一樣', '跟', '同上', '加一', '再來', '還要',
+                      '取消', '不要', '退', '改', '換']
+    return any(kw in text for kw in order_keywords)
+
+
+def build_nlu_prompt(title, items, orders, user_name, user_text):
+    """組合 NLU prompt"""
+    # 品項清單
+    items_text = ""
+    for item in items:
+        item_num = item[2]
+        name = item[3]
+        price_info = item[4] or name
+        items_text += f"  {item_num}. {name} ({price_info})\n"
+
+    # 用戶現有訂單
+    user_orders_text = "無"
+    user_order_list = [o for o in orders if o[4] == user_name]
+    if user_order_list:
+        user_orders_text = ", ".join(
+            f"品項{o[2]} x{o[5]}" for o in user_order_list
+        )
+
+    prompt = f"""你是團購接龍助理的語意分析模組。
+
+目前團購「{title}」的品項列表：
+{items_text}
+用戶「{user_name}」目前已下單：{user_orders_text}
+
+用戶發了這則訊息：「{user_text}」
+
+請判斷用戶的意圖，回覆嚴格的 JSON 格式（不要加其他文字）：
+
+情況1 - 明確要下單：
+{{"action": "order", "item_num": 品項編號, "quantity": 數量, "for_name": "下單人名字或null"}}
+
+情況2 - 明確要取消：
+{{"action": "cancel", "item_num": 品項編號, "for_name": "取消人名字或null"}}
+
+情況3 - 明確要修改數量：
+{{"action": "update", "item_num": 品項編號, "quantity": 新數量, "for_name": "修改人名字或null"}}
+
+情況4 - 意圖跟團購有關但不明確，需要釐清：
+{{"action": "clarify", "message": "你的釐清問題（用繁體中文，簡短友善）"}}
+
+情況5 - 跟團購無關的閒聊：
+{{"action": "ignore"}}
+
+注意：
+- for_name 預設為 null（代表用戶自己），只有明確幫別人訂才填名字
+- quantity 預設為 1
+- 如果用戶說「我也要」「跟上面一樣」但無法判斷是哪個品項，用 clarify
+- 如果用戶說了品項名稱但品項列表中有多個類似的，用 clarify 列出選項
+- 釐清問題要簡短，列出可能的選項讓用戶選擇
+- 只回覆 JSON，不要加任何其他文字"""
+
+    return prompt
+
+
+def cmd_nlu_order(group_id, user_id, user_name, text):
+    """用 Claude 理解自然語言下單意圖"""
+    if not claude_client:
+        return None
+
+    active = get_active_buy(group_id)
+    if not active:
+        return None
+
+    buy_id = active[0]
+    title = active[2]
+    items = get_items(buy_id)
+    orders = get_orders(buy_id)
+
+    # 預先過濾
+    if not is_possibly_order_related(text, items):
+        return None
+
+    # 呼叫 Claude
+    prompt = build_nlu_prompt(title, items, orders, user_name, text)
+    try:
+        message = claude_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=500,
+            system="你是團購語意分析模組。只回覆 JSON，不要加其他文字。",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        result_text = message.content[0].text.strip()
+
+        # 解析 JSON（處理可能的 markdown code block）
+        if result_text.startswith("```"):
+            result_text = result_text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        result = json.loads(result_text)
+
+    except Exception as e:
+        logger.error(f"[nlu] Claude 呼叫或解析失敗: {e}")
+        return None  # 失敗就靜默，不影響正常使用
+
+    action = result.get("action")
+
+    if action == "ignore":
+        return None
+
+    elif action == "clarify":
+        return f"🤔 {result.get('message', '請問你想訂什麼呢？')}"
+
+    elif action == "order":
+        item_num = result.get("item_num")
+        quantity = result.get("quantity", 1)
+        for_name = result.get("for_name")
+
+        # 驗證品項存在
+        item_name = get_item_name(buy_id, item_num)
+        if not item_name:
+            return f"🤔 找不到品項【{item_num}】，請確認編號。\n輸入「列表」查看所有品項。"
+
+        # 組合標準下單指令，複用現有 cmd_order
+        if for_name:
+            order_text = f"+{item_num} {for_name} {quantity}"
+        else:
+            order_text = f"+{item_num} {quantity}"
+
+        order_result = cmd_order(group_id, user_id, user_name, order_text)
+        return f"🤖 AI 理解：{order_result}"
+
+    elif action == "cancel":
+        item_num = result.get("item_num")
+        for_name = result.get("for_name")
+
+        if for_name:
+            cancel_text = f"退出 {item_num} {for_name}"
+        else:
+            cancel_text = f"退出 {item_num}"
+
+        cancel_result = cmd_cancel_order(group_id, user_id, user_name, cancel_text)
+        return f"🤖 AI 理解：{cancel_result}"
+
+    elif action == "update":
+        item_num = result.get("item_num")
+        quantity = result.get("quantity", 1)
+        for_name = result.get("for_name")
+
+        item_name = get_item_name(buy_id, item_num)
+        if not item_name:
+            return f"🤔 找不到品項【{item_num}】，請確認編號。"
+
+        if for_name:
+            order_text = f"+{item_num} {for_name} {quantity}"
+        else:
+            order_text = f"+{item_num} {quantity}"
+
+        order_result = cmd_order(group_id, user_id, user_name, order_text)
+        return f"🤖 AI 理解（修改數量）：{order_result}"
+
+    return None
+
+
+def cmd_ai_summary(group_id):
+    """AI 智能訂單統計"""
+    if not claude_client:
+        return "⚠️ AI 功能未啟用（ANTHROPIC_API_KEY 未設定）"
+
+    active = get_active_buy(group_id)
+    if not active:
+        return "目前沒有進行中的團購。"
+
+    buy_id = active[0]
+    title = active[2]
+    items = get_items(buy_id)
+    orders = get_orders(buy_id)
+
+    if not orders:
+        return f"📋 {title}\n目前還沒有人下單。"
+
+    # 組合訂單資料
+    items_text = ""
+    for item in items:
+        price = extract_price(item[4])
+        price_str = f" - 單價 {price} 元" if price else ""
+        items_text += f"  {item[2]}. {item[3]}{price_str}\n"
+
+    orders_text = ""
+    for o in orders:
+        item_name = get_item_name(buy_id, o[2]) or f"品項{o[2]}"
+        orders_text += f"  - {o[4]}: {item_name}(品項{o[2]}) x{o[5]}\n"
+
+    prompt = f"""以下是團購「{title}」的訂單資料，請做統計分析：
+
+【品項列表】
+{items_text}
+【訂單明細】
+{orders_text}
+請產出以下報告：
+1. 📊 品項統計：每個品項的總訂購數量和金額小計
+2. 👥 人員統計：每個人買了哪些品項、各多少份、應付總金額
+3. 💰 總計：總訂購份數和總金額
+
+格式要求：簡潔清楚，適合 LINE 群組顯示，用 emoji 和分隔線排版。"""
+
+    result = call_claude(prompt)
+    if result:
+        return f"🤖 AI 統計分析\n━━━━━━━━━━━━━━\n{result}"
+    else:
+        # fallback：回傳現有的列表功能
+        return cmd_list(group_id)
 
 
 # ══════════════════════════════════════════
@@ -813,9 +1069,20 @@ def handle_message(event):
     elif text in ("取消團購",):
         reply = cmd_cancel_buy(gid, uid)
 
+    # ── AI 統計
+    elif text in ("統計", "AI統計", "智能統計"):
+        reply = cmd_ai_summary(gid)
+
     # ── 團購說明（所有人可用）
     elif text in ("團購說明", "操作說明", "說明"):
         reply = HELP_TEXT
+
+    # ── AI 自然語言理解（放在所有指令判斷的最後）
+    if reply is None and len(text) >= 2 and len(text) <= 200:
+        if not re.match(r'^[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF\s]+$', text):
+            nlu_reply = cmd_nlu_order(gid, uid, lazy_name(), text)
+            if nlu_reply:
+                reply = nlu_reply
 
     logger.info(f"[msg] reply={'（無）' if reply is None else repr(reply[:40])}")
 
