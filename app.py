@@ -560,7 +560,7 @@ def cmd_list(group_id):
 
 
 def cmd_my_orders(group_id, user_id, user_name):
-    """我的訂單：查看自己的下單"""
+    """我的訂單：查看自己的下單（含代訂）"""
     active = get_active_buy(group_id)
     if not active:
         return "目前沒有進行中的團購。"
@@ -571,22 +571,42 @@ def cmd_my_orders(group_id, user_id, user_name):
 
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+
+    # 自己的訂單（user_id 比對，排除代訂）
     c.execute(
-        "SELECT item_num, quantity FROM orders WHERE group_buy_id=? AND user_name=? ORDER BY item_num",
-        (buy_id, my_name),
+        "SELECT item_num, user_name, quantity FROM orders WHERE group_buy_id=? AND user_id=? AND registered_by IS NULL ORDER BY item_num",
+        (buy_id, user_id),
     )
-    my_orders = c.fetchall()
+    own_orders = c.fetchall()
+
+    # 幫別人代訂的（registered_by 不為空，且 user_id 是自己）
+    c.execute(
+        "SELECT item_num, user_name, quantity FROM orders WHERE group_buy_id=? AND user_id=? AND registered_by IS NOT NULL ORDER BY item_num",
+        (buy_id, user_id),
+    )
+    proxy_orders = c.fetchall()
+
     conn.close()
 
-    if not my_orders:
+    if not own_orders and not proxy_orders:
         return f"📋 {title}\n你目前沒有下單。"
 
     lines = [f"📋 {title}", f"👤 {my_name} 的訂單", "────────────────"]
-    for item_num, qty in my_orders:
+
+    for item_num, name, qty in own_orders:
         item_name = get_item_name(buy_id, item_num) or f"品項{item_num}"
         lines.append(f"【{item_num}】{item_name} x{qty}")
+
+    if proxy_orders:
+        lines.append("")
+        lines.append("📦 代訂：")
+        for item_num, name, qty in proxy_orders:
+            item_name = get_item_name(buy_id, item_num) or f"品項{item_num}"
+            lines.append(f"【{item_num}】{item_name} x{qty}（{name}）")
+
     lines.append("────────────────")
-    lines.append(f"共 {len(my_orders)} 項")
+    total = len(own_orders) + len(proxy_orders)
+    lines.append(f"共 {total} 項")
 
     return '\n'.join(lines)
 
