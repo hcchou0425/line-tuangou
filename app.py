@@ -54,11 +54,12 @@ HELP_TEXT = """📖 團購指令說明
 #開團 + 商品列表（多行貼文）
 
 【下單方式】
-#N　　　　　　　 下單品項N（1份）
 #N 數量　　　　　下單品項N指定數量
+#N+數量　　　　　同上（如 #1+2）
 #N 名字　　　　　幫人下單1份
 #N 名字 數量　　 幫人下單指定數量
-　（+N 或 N. 格式也通用）
+#N #M 名字　　　 一次下單多品項
+　（例：#1 2份、#1+2、#1 小明 3份）
 
 【其他指令】
 退出 N　　　　　 取消品項N的訂單
@@ -752,20 +753,45 @@ def handle_message(event):
     if re.match(r'^\s*#?開團', text) and '\n' in text:
         reply = cmd_open(gid, uid, lazy_name(), text)
 
-    # ── 多品項下單（+1 +3 +5 名字 或 #1 #3 #5 名字）
-    elif len(re.findall(r'[+#]\d+', text)) > 1:
+    # ── #N+M 格式（品項N，數量M，如 #1+2 = 品項1訂2份）
+    elif re.match(r'^[+#]\d+\+\d+\s*[份個包組盒袋條]?\s*$', text):
+        m = re.match(r'^[+#](\d+)\+(\d+)', text)
+        reply = cmd_order(gid, uid, lazy_name(), f"+{m.group(1)} {m.group(2)}")
+
+    # ── 多品項下單（#1 #3 #5 名字，需有空格分隔）
+    elif len(re.findall(r'(?:^|\s)[+#]\d+', text)) > 1:
         # 統一 # 為 + 格式
         reply = cmd_order_multi(gid, uid, lazy_name(), text.replace('#', '+'))
 
-    # ── 單品項下單（+N 或 #N）
-    elif re.match(r'[+#]\d+(\s|$)', text):
+    # ── 單品項下單（#N 數量 / #N 名字 等，#N 後面必須有內容）
+    elif re.match(r'^[+#]\d+\s+\S', text):
         reply = cmd_order(gid, uid, lazy_name(), text.replace('#', '+', 1))
 
-    # ── 數字點格式下單（1. / 1. 2 / 1. 小明 / 1. 小明 2）
-    elif re.match(r'^\d+[\.．](\s|$)', text):
+    # ── 單獨 #N（無數量無名字）→ 不動作，提示補充數量
+    elif re.match(r'^[+#]\d+\s*$', text):
+        active = get_active_buy(gid)
+        if active:
+            m = re.match(r'^[+#](\d+)', text)
+            item_num = int(m.group(1))
+            item_name = get_item_name(active[0], item_num)
+            if item_name:
+                reply = f"📝【{item_num}】{item_name}\n請輸入數量，例如：#{item_num} 1份"
+
+    # ── 數字點格式下單（1. 2 / 1. 小明，1. 後面必須有內容）
+    elif re.match(r'^\d+[\.．]\s+\S', text):
         m_dot = re.match(r'^(\d+)[\.．]\s*(.*)', text)
         rest = m_dot.group(2).strip() if m_dot.group(2) else ""
         reply = cmd_order(gid, uid, lazy_name(), f"+{m_dot.group(1)} {rest}".strip())
+
+    # ── 單獨 N.（無內容）→ 不動作，提示補充數量
+    elif re.match(r'^\d+[\.．]\s*$', text):
+        active = get_active_buy(gid)
+        if active:
+            m = re.match(r'^(\d+)', text)
+            item_num = int(m.group(1))
+            item_name = get_item_name(active[0], item_num)
+            if item_name:
+                reply = f"📝【{item_num}】{item_name}\n請輸入數量，例如：#{item_num} 1份"
 
     # ── 退出
     elif re.match(r'退出\s+\d+', text):
