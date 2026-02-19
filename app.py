@@ -633,14 +633,20 @@ def cmd_list(group_id):
         item_orders = orders_by_item.get(item_num, [])
         if item_orders:
             subtotal = 0
+            item_amount = 0
             for o in item_orders:
                 name = o[4] or "（未知）"
                 qty = o[5]
                 subtotal += qty
-                lines.append(f"   👤 {name} x{qty}")
+                # 階梯價按每個人的數量計算
+                person_amount = calculate_amount(price_info, qty)
+                if person_amount:
+                    lines.append(f"   👤 {name} x{qty}　💰{person_amount}元")
+                    item_amount += person_amount
+                else:
+                    lines.append(f"   👤 {name} x{qty}")
             total_orders += subtotal
             item_amount_str = ""
-            item_amount = calculate_amount(price_info, subtotal)
             if item_amount:
                 total_amount += item_amount
                 has_price = True
