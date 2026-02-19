@@ -367,6 +367,7 @@ def cmd_order(group_id, user_id, user_name, text):
     # 解析 rest：數量 / 名字 / 名字 數量
     order_name = user_name or "（未知）"
     quantity = 1
+    explicit_qty = False  # 是否明確指定數量
     registered_by = None
 
     if rest:
@@ -374,6 +375,7 @@ def cmd_order(group_id, user_id, user_name, text):
         qty_m = re.match(r'^(\d+)\s*[份個包組盒袋條]?$', rest)
         if qty_m:
             quantity = int(qty_m.group(1))
+            explicit_qty = True
         else:
             # 名字 [數量]
             parts = rest.rsplit(None, 1)
@@ -382,6 +384,7 @@ def cmd_order(group_id, user_id, user_name, text):
                 if qty_m2:
                     order_name = parts[0]
                     quantity = int(qty_m2.group(1))
+                    explicit_qty = True
                     registered_by = user_name
                 else:
                     order_name = rest
@@ -393,7 +396,7 @@ def cmd_order(group_id, user_id, user_name, text):
     if quantity < 1:
         return "⚠️ 數量必須大於 0"
 
-    # 累加制：查詢是否已有同品項同名的訂單
+    # 查詢是否已有同品項同名的訂單
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
@@ -403,9 +406,15 @@ def cmd_order(group_id, user_id, user_name, text):
     existing = c.fetchone()
 
     if existing:
-        new_qty = existing[1] + quantity
-        c.execute("UPDATE orders SET quantity=? WHERE id=?", (new_qty, existing[0]))
-        total = new_qty
+        if explicit_qty:
+            # 明確指定數量 → 設定為該數量
+            c.execute("UPDATE orders SET quantity=? WHERE id=?", (quantity, existing[0]))
+            total = quantity
+        else:
+            # 未指定數量（#N）→ 累加 1
+            new_qty = existing[1] + quantity
+            c.execute("UPDATE orders SET quantity=? WHERE id=?", (new_qty, existing[0]))
+            total = new_qty
     else:
         c.execute(
             "INSERT INTO orders (group_buy_id, item_num, user_id, user_name, quantity, registered_by) VALUES (?, ?, ?, ?, ?, ?)",
@@ -416,7 +425,10 @@ def cmd_order(group_id, user_id, user_name, text):
     conn.commit()
     conn.close()
 
-    return f"✅ {order_name}【{item_num}】{item_name} +{quantity}份（共 {total} 份）"
+    if explicit_qty and existing:
+        return f"✅ {order_name}【{item_num}】{item_name} → {total} 份"
+    else:
+        return f"✅ {order_name}【{item_num}】{item_name} +{quantity}份（共 {total} 份）"
 
 
 def cmd_order_multi(group_id, user_id, user_name, text):
