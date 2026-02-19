@@ -28,14 +28,19 @@ LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 DB_PATH = os.environ.get("DB_PATH", "/data/tuangou.db")
 
-# 立即檢查 DB 目錄是否可用，不可用就 fallback 到當前目錄
-_db_dir = os.path.dirname(DB_PATH)
-if _db_dir and not os.path.exists(_db_dir):
-    try:
+# 立即檢查 DB 路徑是否可寫，不可用就 fallback 到當前目錄
+try:
+    _db_dir = os.path.dirname(DB_PATH)
+    if _db_dir:
         os.makedirs(_db_dir, exist_ok=True)
-    except OSError:
-        DB_PATH = "tuangou.db"
-        logger.warning(f"[startup] /data 不存在，改用當前目錄: {DB_PATH}")
+    # 嘗試實際開啟 DB 測試寫入
+    _test_conn = sqlite3.connect(DB_PATH)
+    _test_conn.execute("CREATE TABLE IF NOT EXISTS _ping (id INTEGER)")
+    _test_conn.close()
+    logger.info(f"[startup] 資料庫路徑可用: {DB_PATH}")
+except Exception:
+    DB_PATH = "tuangou.db"
+    logger.warning(f"[startup] 原路徑不可寫，改用當前目錄: {DB_PATH}")
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
