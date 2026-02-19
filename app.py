@@ -62,14 +62,14 @@ HELP_TEXT = """📖 團購指令說明
 退出 N 名字　　　取消指定人的訂單
 列表　　　　　　　查看所有下單狀況
 我的訂單　　　　　查看自己的訂單
+團購說明　　　　　顯示本說明
 
 ━━━━━━━━━━━━━━
 【團主專用】
 指令　　　　　　　說明
 ──────────────
 結團　　　　　　　封存最終訂單
-取消團購　　　　　刪除所有資料
-團購說明　　　　　顯示本說明"""
+取消團購　　　　　刪除所有資料"""
 
 
 # ══════════════════════════════════════════
@@ -721,15 +721,9 @@ def handle_message(event):
     elif text in ("取消團購",):
         reply = cmd_cancel_buy(gid, uid)
 
-    # ── 團購說明（團主專用）
-    elif text in ("團購說明",):
-        active = get_active_buy(gid)
-        if active and active[4] == uid:
-            reply = HELP_TEXT
-        elif not active:
-            reply = HELP_TEXT
-        else:
-            reply = "此指令僅限團主使用。"
+    # ── 團購說明（所有人可用）
+    elif text in ("團購說明", "操作說明", "說明"):
+        reply = HELP_TEXT
 
     logger.info(f"[msg] reply={'（無）' if reply is None else repr(reply[:40])}")
 
