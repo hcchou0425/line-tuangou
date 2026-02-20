@@ -1478,8 +1478,8 @@ def handle_message(event):
     elif re.match(r'退出\s+\d+', text):
         reply = cmd_cancel_order(gid, uid, lazy_name(), text)
 
-    # ── 列表（支援「列表 N」指定團購）
-    elif re.match(r'^(?:列表|/列表|查看|清單)(?:\s+(\d+))?\s*$', text):
+    # ── 列表（支援「列表N」或「列表 N」指定團購）
+    elif re.match(r'^(?:列表|/列表|查看|清單)\s*(\d+)?\s*$', text):
         m_list = re.match(r'^(?:列表|/列表|查看|清單)\s*(\d+)?', text)
         bn = int(m_list.group(1)) if m_list.group(1) else None
         reply = cmd_list(gid, bn)
@@ -1488,20 +1488,20 @@ def handle_message(event):
     elif text in ("我的訂單", "我的單"):
         reply = cmd_my_orders(gid, uid, lazy_name())
 
-    # ── 結團（團主專用，支援「結團 N」）
-    elif re.match(r'^結團(?:\s+\d+)?\s*$', text):
+    # ── 結團（團主專用，支援「結團N」或「結團 N」）
+    elif re.match(r'^結團\s*(\d+)?\s*$', text):
         m_close = re.match(r'^結團\s*(\d+)?', text)
         bn = int(m_close.group(1)) if m_close.group(1) else None
         reply = cmd_close(gid, uid, bn)
 
-    # ── 取消團購（團主專用，支援「取消團購 N」）
-    elif re.match(r'^取消團購(?:\s+\d+)?\s*$', text):
+    # ── 取消團購（團主專用，支援「取消團購N」或「取消團購 N」）
+    elif re.match(r'^取消團購\s*(\d+)?\s*$', text):
         m_cancel = re.match(r'^取消團購\s*(\d+)?', text)
         bn = int(m_cancel.group(1)) if m_cancel.group(1) else None
         reply = cmd_cancel_buy(gid, uid, bn)
 
-    # ── AI 統計（支援「統計 N」）
-    elif re.match(r'^(?:統計|AI統計|智能統計)(?:\s+(\d+))?\s*$', text):
+    # ── AI 統計（支援「統計N」或「統計 N」）
+    elif re.match(r'^(?:統計|AI統計|智能統計)\s*(\d+)?\s*$', text):
         m_stat = re.match(r'^(?:統計|AI統計|智能統計)\s*(\d+)?', text)
         bn = int(m_stat.group(1)) if m_stat.group(1) else None
         reply = cmd_ai_summary(gid, bn)
