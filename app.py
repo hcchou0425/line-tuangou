@@ -132,6 +132,7 @@ def init_db():
             item_num      INTEGER NOT NULL,
             name          TEXT    NOT NULL,
             price_info    TEXT,
+            max_quantity  INTEGER,
             FOREIGN KEY (group_buy_id) REFERENCES group_buys (id)
         )
     """)
@@ -155,6 +156,20 @@ def init_db():
             c.execute(f"ALTER TABLE group_buys ADD COLUMN {col} {col_def}")
         except Exception:
             pass
+
+    # 遷移：items 表加入 max_quantity 欄位
+    try:
+        c.execute("ALTER TABLE items ADD COLUMN max_quantity INTEGER")
+    except Exception:
+        pass
+
+    # 遷移：將 group_buys.max_quantity 複製到其所有 items
+    c.execute("""
+        UPDATE items SET max_quantity = (
+            SELECT gb.max_quantity FROM group_buys gb
+            WHERE gb.id = items.group_buy_id AND gb.max_quantity IS NOT NULL
+        ) WHERE max_quantity IS NULL
+    """)
 
     conn.commit()
     conn.close()
@@ -214,7 +229,7 @@ def get_items(group_buy_id):
     c.execute("SELECT * FROM items WHERE group_buy_id=? ORDER BY item_num", (group_buy_id,))
     rows = c.fetchall()
     conn.close()
-    # cols: id, group_buy_id, item_num, name, price_info
+    # cols: id, group_buy_id, item_num, name, price_info, max_quantity
     return rows
 
 
@@ -279,6 +294,14 @@ def extract_price_tiers(price_info):
     return sorted(tiers, key=lambda t: t[0])
 
 
+def extract_item_limit(price_info):
+    """從品項描述中提取限量數（如「限量25組」→ 25）"""
+    if not price_info:
+        return None
+    m = re.search(r'限量\s*(\d+)\s*[份個組包盒袋條]?', price_info)
+    return int(m.group(1)) if m else None
+
+
 def calculate_amount(price_info, quantity):
     """根據價格階梯計算最佳金額
     例如 '220元／2包420元', qty=2 → 420（不是 440）
@@ -340,44 +363,85 @@ def resolve_buy_for_item(group_id, item_num):
         return (None, f"⚠️ 沒有品項【{item_num}】，請確認編號。")
 
 
-def check_auto_close(buy_id, group_id):
-    """檢查是否達到數量上限，若達到則自動結團
-    回傳結團公告字串，或 None
+def check_item_progress(buy_id, item_num):
+    """檢查品項的限量進度
+    回傳進度字串（如 📊 【1】已訂 X/Y 份）或 None
     """
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('SELECT max_quantity, buy_num, title FROM group_buys WHERE id=?', (buy_id,))
+    c.execute(
+        'SELECT max_quantity FROM items WHERE group_buy_id=? AND item_num=?',
+        (buy_id, item_num),
+    )
     row = c.fetchone()
     if not row or row[0] is None:
         conn.close()
         return None
 
     max_qty = row[0]
-    buy_num = row[1]
-    title = row[2]
-
-    c.execute('SELECT COALESCE(SUM(quantity), 0) FROM orders WHERE group_buy_id=?', (buy_id,))
+    c.execute(
+        'SELECT COALESCE(SUM(quantity), 0) FROM orders WHERE group_buy_id=? AND item_num=?',
+        (buy_id, item_num),
+    )
     total = c.fetchone()[0]
+    conn.close()
 
     if total >= max_qty:
+        return f"🔴 【{item_num}】已額滿"
+    remaining = max_qty - total
+    return f"📊 【{item_num}】已訂 {total}/{max_qty} 份（剩餘 {remaining} 份）"
+
+
+def check_auto_close(buy_id, group_id):
+    """檢查是否所有限量品項都已額滿，若是則自動結團
+    - 若有任何品項 max_quantity IS NULL → 不自動結團
+    - 所有品項都有限量且都額滿 → 結團
+    回傳結團公告字串，或 None
+    """
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    # 取所有品項的 max_quantity
+    c.execute('SELECT item_num, max_quantity FROM items WHERE group_buy_id=?', (buy_id,))
+    items = c.fetchall()
+    if not items:
+        conn.close()
+        return None
+
+    # 若有任何品項無限量 → 不自動結團
+    if any(item[1] is None for item in items):
+        conn.close()
+        return None
+
+    # 逐品項檢查是否額滿
+    all_full = True
+    for item_num, max_qty in items:
+        c.execute(
+            'SELECT COALESCE(SUM(quantity), 0) FROM orders WHERE group_buy_id=? AND item_num=?',
+            (buy_id, item_num),
+        )
+        total = c.fetchone()[0]
+        if total < max_qty:
+            all_full = False
+            break
+
+    if all_full:
         c.execute("UPDATE group_buys SET status='closed' WHERE id=?", (buy_id,))
         conn.commit()
         conn.close()
 
-        # 產生結團公告
         buy_list = format_buy_list(buy_id, show_label=True)
-        return f"\n\n🔒 已達限量 {max_qty} 份，自動結團！\n\n{buy_list}"
+        return f"\n\n🔒 所有限量品項已額滿，自動結團！\n\n{buy_list}"
     else:
         conn.close()
-        remaining = max_qty - total
-        return f"\n📊 已訂 {total}/{max_qty} 份（剩餘 {remaining} 份）"
+        return None
 
 
 def format_buy_list(buy_id, show_label=False):
     """格式化單一團購訂單列表"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('SELECT title, buy_num, max_quantity FROM group_buys WHERE id=?', (buy_id,))
+    c.execute('SELECT title, buy_num FROM group_buys WHERE id=?', (buy_id,))
     buy_row = c.fetchone()
     conn.close()
     if not buy_row:
@@ -385,7 +449,6 @@ def format_buy_list(buy_id, show_label=False):
 
     title = buy_row[0]
     buy_num = buy_row[1]
-    max_qty = buy_row[2]
 
     items = get_items(buy_id)
     orders = get_orders(buy_id)
@@ -396,8 +459,7 @@ def format_buy_list(buy_id, show_label=False):
         orders_by_item.setdefault(o[2], []).append(o)
 
     label = f"[團購{buy_num}] " if show_label else ""
-    qty_info = f"（限量 {max_qty} 份）" if max_qty else ""
-    lines = [f"🛒 {label}{title}{qty_info}", "────────────────"]
+    lines = [f"🛒 {label}{title}", "────────────────"]
     total_orders = 0
     total_amount = 0
     has_price = False
@@ -405,9 +467,16 @@ def format_buy_list(buy_id, show_label=False):
     for item in items:
         item_num = item[2]
         price_info = item[4] or item[3]
+        item_max_qty = item[5]  # max_quantity
 
+        # 品項標題（含限量標示）
+        item_header = f"【{item_num}】"
         info_lines = price_info.split('\n')
-        lines.append(f"【{item_num}】{info_lines[0]}")
+        if item_max_qty:
+            item_header += f"{info_lines[0]}（限量 {item_max_qty} 份）"
+        else:
+            item_header += info_lines[0]
+        lines.append(item_header)
         for extra in info_lines[1:]:
             lines.append(f"　　{extra}")
 
@@ -431,7 +500,11 @@ def format_buy_list(buy_id, show_label=False):
                 total_amount += item_amount
                 has_price = True
                 item_amount_str = f"　💰{item_amount}元"
-            lines.append(f"   小計：{subtotal} 份{item_amount_str}")
+            if item_max_qty:
+                remaining = item_max_qty - subtotal
+                lines.append(f"   小計：{subtotal}/{item_max_qty} 份（剩餘 {remaining} 份）{item_amount_str}")
+            else:
+                lines.append(f"   小計：{subtotal} 份{item_amount_str}")
         else:
             lines.append("   （尚無人下單）")
 
@@ -554,16 +627,26 @@ def cmd_open(group_id, user_id, user_name, text):
     """開團：解析貼文建立團購（允許同群組多團購）"""
     full_text = text  # 保留原始完整貼文
 
-    # 解析限量數量
-    max_quantity = None
-    limit_m = re.search(r'限量\s*(\d+)\s*[份個]?', text)
-    if limit_m:
-        max_quantity = int(limit_m.group(1))
-
     title, items_list = parse_group_buy(text)
 
     if not items_list:
         return "⚠️ 無法解析品項，請確認格式：\n#開團\n標題\n1) 品名 價格\n2) 品名 價格"
+
+    # 解析限量：先掃描每個品項的 price_info → per-item 限量
+    item_limits = {}  # {item_num: limit or None}
+    for item_num, name, price_info in items_list:
+        item_limits[item_num] = extract_item_limit(price_info)
+
+    has_per_item = any(v is not None for v in item_limits.values())
+
+    if not has_per_item:
+        # 無 per-item → 檢查首行全域限量（#開團 限量N份）
+        first_line = text.split('\n')[0] if text else ""
+        limit_m = re.search(r'限量\s*(\d+)\s*[份個組包盒袋條]?', first_line)
+        if limit_m:
+            global_limit = int(limit_m.group(1))
+            for item_num in item_limits:
+                item_limits[item_num] = global_limit
 
     # 計算 buy_num = 群組內最大 buy_num + 1
     existing_buys = get_active_buys(group_id)
@@ -576,16 +659,17 @@ def cmd_open(group_id, user_id, user_name, text):
     max_num = c.fetchone()[0]
     buy_num = max_num + 1
 
+    # group_buys.max_quantity 不再使用，設為 None
     c.execute(
         "INSERT INTO group_buys (group_id, title, description, creator_id, creator_name, buy_num, max_quantity) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (group_id, title, full_text, user_id, user_name, buy_num, max_quantity),
+        (group_id, title, full_text, user_id, user_name, buy_num, None),
     )
     buy_id = c.lastrowid
 
     for item_num, name, price_info in items_list:
         c.execute(
-            "INSERT INTO items (group_buy_id, item_num, name, price_info) VALUES (?, ?, ?, ?)",
-            (buy_id, item_num, name, price_info),
+            "INSERT INTO items (group_buy_id, item_num, name, price_info, max_quantity) VALUES (?, ?, ?, ?, ?)",
+            (buy_id, item_num, name, price_info, item_limits.get(item_num)),
         )
 
     conn.commit()
@@ -605,8 +689,19 @@ def cmd_open(group_id, user_id, user_name, text):
             lines.append(f"　　{extra}")
     lines.append("────────────────")
 
-    if max_quantity:
-        lines.append(f"⚠️ 限量 {max_quantity} 份，額滿自動結團")
+    # 限量顯示
+    limits_with_value = {k: v for k, v in item_limits.items() if v is not None}
+    if limits_with_value:
+        all_same = len(set(limits_with_value.values())) == 1 and len(limits_with_value) == len(items_list)
+        if all_same:
+            # 全部品項同限量
+            lines.append(f"⚠️ 限量 {list(limits_with_value.values())[0]} 份，額滿自動結團")
+        else:
+            # per-item 逐項顯示
+            for item_num, name, price_info in items_list:
+                lim = item_limits.get(item_num)
+                if lim is not None:
+                    lines.append(f"⚠️ 【{item_num}】{name} 限量 {lim} 份")
 
     lines.append("下單方式：#品項編號")
     lines.append("例如：#1 或 #1 2（2份）")
@@ -686,16 +781,39 @@ def cmd_order(group_id, user_id, user_name, text, target_buy=None, skip_auto_clo
     )
     existing = c.fetchone()
 
+    # 計算 delta（新增量）
+    old_qty = existing[1] if existing else 0
+    if explicit_qty:
+        new_qty = quantity
+    else:
+        new_qty = old_qty + quantity
+    delta = new_qty - old_qty
+
+    # per-item 限量檢查
+    c.execute(
+        'SELECT max_quantity FROM items WHERE group_buy_id=? AND item_num=?',
+        (buy_id, item_num),
+    )
+    item_row = c.fetchone()
+    item_max_qty = item_row[0] if item_row else None
+
+    if item_max_qty is not None and delta > 0:
+        c.execute(
+            'SELECT COALESCE(SUM(quantity), 0) FROM orders WHERE group_buy_id=? AND item_num=?',
+            (buy_id, item_num),
+        )
+        current_item_total = c.fetchone()[0]
+        if current_item_total + delta > item_max_qty:
+            conn.close()
+            remaining = item_max_qty - current_item_total
+            if remaining <= 0:
+                return f"⚠️ 【{item_num}】{item_name} 已額滿（限量 {item_max_qty} 份）"
+            else:
+                return f"⚠️ 【{item_num}】{item_name} 剩餘 {remaining} 份，無法再加 {delta} 份"
+
     if existing:
-        if explicit_qty:
-            # 明確指定數量 → 設定為該數量
-            c.execute("UPDATE orders SET quantity=? WHERE id=?", (quantity, existing[0]))
-            total = quantity
-        else:
-            # 未指定數量（#N）→ 累加 1
-            new_qty = existing[1] + quantity
-            c.execute("UPDATE orders SET quantity=? WHERE id=?", (new_qty, existing[0]))
-            total = new_qty
+        c.execute("UPDATE orders SET quantity=? WHERE id=?", (new_qty, existing[0]))
+        total = new_qty
     else:
         c.execute(
             "INSERT INTO orders (group_buy_id, item_num, user_id, user_name, quantity, registered_by) VALUES (?, ?, ?, ?, ?, ?)",
@@ -715,6 +833,11 @@ def cmd_order(group_id, user_id, user_name, text, target_buy=None, skip_auto_clo
     else:
         result = f"✅ {label}{order_name}【{item_num}】{item_name} +{quantity}份（共 {total} 份）"
 
+    # 品項限量進度
+    progress = check_item_progress(buy_id, item_num)
+    if progress:
+        result += f"\n{progress}"
+
     # 檢查自動結團（批次下單時由呼叫端統一處理）
     if not skip_auto_close:
         auto_close = check_auto_close(buy_id, group_id)
@@ -731,63 +854,33 @@ def cmd_order_multi(group_id, user_id, user_name, text, target_buy=None):
 
     # 提取名字（去除所有 +N 後的剩餘文字）
     rest = re.sub(r'\+\d+', '', text).strip()
-    order_name = rest if rest else (user_name or "（未知）")
-    registered_by = user_name if rest else None
 
     results = []
     affected_buys = set()
     for item_num in item_nums:
-        # 決定目標團購
+        # 組合 order_text 給 cmd_order
+        if rest:
+            order_text = f"+{item_num} {rest}"
+        else:
+            order_text = f"+{item_num}"
+
+        order_result = cmd_order(group_id, user_id, user_name, order_text, target_buy=target_buy, skip_auto_close=True)
+        if order_result is None:
+            return None
+        results.append(order_result)
+
+        # 追蹤受影響的團購（用於自動結團檢查）
         if target_buy:
-            active = target_buy
+            affected_buys.add(target_buy[0])
         else:
-            active, err = resolve_buy_for_item(group_id, item_num)
-            if err:
-                results.append(err)
-                continue
-            if not active:
-                return None
-
-        buy_id = active[0]
-        buy_num = active[8]
-
-        item_name = get_item_name(buy_id, item_num)
-        if not item_name:
-            results.append(f"⚠️ 沒有品項【{item_num}】")
-            continue
-
-        # 累加制
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute(
-            "SELECT id, quantity FROM orders WHERE group_buy_id=? AND item_num=? AND user_name=?",
-            (buy_id, item_num, order_name),
-        )
-        existing = c.fetchone()
-
-        if existing:
-            new_qty = existing[1] + 1
-            c.execute("UPDATE orders SET quantity=? WHERE id=?", (new_qty, existing[0]))
-            total = new_qty
-        else:
-            c.execute(
-                "INSERT INTO orders (group_buy_id, item_num, user_id, user_name, quantity, registered_by) VALUES (?, ?, ?, ?, ?, ?)",
-                (buy_id, item_num, user_id, order_name, 1, registered_by),
-            )
-            total = 1
-
-        conn.commit()
-        conn.close()
-
-        multi = len(get_active_buys(group_id)) > 1
-        label = f"[團購{buy_num}] " if multi else ""
-        results.append(f"✅ {label}{order_name}【{item_num}】{item_name}（共 {total} 份）")
-        affected_buys.add(buy_id)
+            buy, _ = resolve_buy_for_item(group_id, item_num)
+            if buy:
+                affected_buys.add(buy[0])
 
     # 檢查所有涉及的團購是否需要自動結團
     for bid in affected_buys:
         auto_close = check_auto_close(bid, group_id)
-        if auto_close and '自動結團' in auto_close:
+        if auto_close:
             results.append(auto_close)
 
     return '\n'.join(results) if results else None

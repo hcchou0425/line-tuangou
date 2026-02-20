@@ -83,7 +83,11 @@ class TestCmdOpen:
         assert "限量" in result
         assert "5" in result
         buys = app.get_active_buys(GID)
-        assert buys[0][9] == 5  # max_quantity
+        # max_quantity 現在存在 items 表，group_buys.max_quantity 應為 None
+        assert buys[0][9] is None
+        items = app.get_items(buys[0][0])
+        assert items[0][5] == 5  # items.max_quantity
+        assert items[1][5] == 5
 
     def test_multi_buy_labels(self):
         """同群組開第二團 → 顯示 [團購N] + 目前共有 N 個團購進行中"""
@@ -261,28 +265,32 @@ class TestCmdBatchOrder:
         assert result is None
 
     def test_batch_no_premature_auto_close(self):
-        """限量團購批次下單：自動結團訊息只應出現一次
-        例：限量5份，水餃×2、蛋餃×3 → 兩項都成功，自動結團一次
+        """限量5份（每品項），水餃×2、蛋餃×3 → 兩項都成功，不會自動結團
+        因為每品項限量5份，品項1只訂了2份，品項2只訂了3份
         """
         open_buy_limited(limit=5)
         result = app.cmd_batch_order(GID, UID, UNAME, "水餃×2、蛋餃×3")
         assert "水餃" in result
         assert "蛋餃" in result
         assert result.count("✅") == 2
-        assert result.count("自動結團") == 1
+        # 不應自動結團（每品項都沒額滿）
+        assert "自動結團" not in result
+        buys = app.get_active_buys(GID)
+        assert len(buys) == 1  # 仍在進行中
 
     def test_batch_first_item_fills_limit(self):
-        """限量3份，水餃×3、蛋餃×2 → 第一項就額滿
-        自動結團訊息應只出現一次，不應重複顯示整個列表
+        """限量3份（每品項），水餃×3、蛋餃×2 → 品項1額滿，品項2未滿
+        不會自動結團（品項2還沒額滿）
         """
         open_buy_limited(limit=3)
         result = app.cmd_batch_order(GID, UID, UNAME, "水餃×3、蛋餃×2")
         assert "水餃" in result
         assert "蛋餃" in result
         assert result.count("✅") == 2
-        # 自動結團訊息只出現一次
-        assert result.count("自動結團") == 1
-        assert result.count("🔒") == 1
+        # 不應自動結團（品項2未額滿）
+        assert "自動結團" not in result
+        buys = app.get_active_buys(GID)
+        assert len(buys) == 1  # 仍在進行中
 
     def test_batch_limited_all_items_ordered(self):
         """限量團購批次下單後，DB 中應有所有品項的訂單"""
@@ -510,13 +518,15 @@ class TestCmdCancelBuy:
 class TestAutoClose:
 
     def test_auto_close_on_limit(self):
-        """限量5份 → 下滿5份 → 自動結團"""
+        """限量5份（每品項）→ 兩品項都下滿5份 → 自動結團"""
         open_buy_limited(limit=5)
         buys = app.get_active_buys(GID)
         buy_id = buys[0][0]
 
-        app.cmd_order(GID, UID, UNAME, "+1 3")
-        app.cmd_order(GID, UID, UNAME, "+2 2")
+        # 品項1填滿5份
+        app.cmd_order(GID, UID, UNAME, "+1 5")
+        # 品項2填滿5份
+        app.cmd_order(GID, UID, UNAME, "+2 5")
 
         # 確認自動結團
         buys = app.get_active_buys(GID)
@@ -536,14 +546,13 @@ class TestAutoClose:
         assert len(buys) == 1
 
     def test_auto_close_progress_message(self):
-        """未達限量時顯示進度"""
+        """未達限量時，下單結果附帶 per-item 進度"""
         open_buy_limited(limit=5)
-        buys = app.get_active_buys(GID)
-        buy_id = buys[0][0]
 
-        app.cmd_order(GID, UID, UNAME, "+1 2")
-        result = app.check_auto_close(buy_id, GID)
-        assert "剩餘" in result
+        result = app.cmd_order(GID, UID, UNAME, "+1 2")
+        # 進度訊息由 check_item_progress 產生
+        assert "已訂 2/5" in result
+        assert "剩餘 3 份" in result
 
 
 # ══════════════════════════════════════════
@@ -870,3 +879,102 @@ class TestEdgeCases:
         c.execute("SELECT COUNT(*) FROM items")
         assert c.fetchone()[0] == 0
         conn.close()
+
+
+# ══════════════════════════════════════════
+# 15. Per-item 限量邏輯
+# ══════════════════════════════════════════
+
+class TestPerItemLimit:
+
+    def test_per_item_limit_parse(self):
+        """品項描述含「限量25組」→ 只該品項有 limit"""
+        text = "#開團\n冰品團購\n1) 新鮮冰花 200元 限量25組\n2) 芒果冰 150元\n3) 草莓冰 180元"
+        result = app.cmd_open(GID, UID, UNAME, text)
+        buys = app.get_active_buys(GID)
+        items = app.get_items(buys[0][0])
+        assert items[0][5] == 25  # 品項1 限量25
+        assert items[1][5] is None  # 品項2 不限量
+        assert items[2][5] is None  # 品項3 不限量
+        # 顯示 per-item 限量
+        assert "限量 25 份" in result
+        assert "【1】" in result
+
+    def test_per_item_sold_out_others_ok(self):
+        """品項1額滿→拒絕，品項2仍可下單，團購不結團"""
+        text = "#開團\n冰品團購\n1) 新鮮冰花 200元 限量2組\n2) 芒果冰 150元"
+        app.cmd_open(GID, UID, UNAME, text)
+
+        # 品項1訂滿2份
+        app.cmd_order(GID, UID, UNAME, "+1 2")
+        # 品項1再訂 → 拒絕
+        result = app.cmd_order(GID, UID2, UNAME2, "+1 1")
+        assert "已額滿" in result
+
+        # 品項2仍可下單
+        result2 = app.cmd_order(GID, UID2, UNAME2, "+2 3")
+        assert "✅" in result2
+        assert "芒果冰" in result2
+
+        # 團購不結團（品項2無限量）
+        buys = app.get_active_buys(GID)
+        assert len(buys) == 1
+
+    def test_per_item_sold_out_reject(self):
+        """品項額滿後再下單→錯誤訊息"""
+        text = "#開團\n冰品團購\n1) 新鮮冰花 200元 限量3組\n2) 芒果冰 150元"
+        app.cmd_open(GID, UID, UNAME, text)
+
+        app.cmd_order(GID, UID, UNAME, "+1 3")
+        result = app.cmd_order(GID, UID2, UNAME2, "+1 1")
+        assert "已額滿" in result
+        assert "限量 3 份" in result
+
+    def test_per_item_remaining_reject(self):
+        """剩2份，訂3份→拒絕"""
+        text = "#開團\n冰品團購\n1) 新鮮冰花 200元 限量5組\n2) 芒果冰 150元"
+        app.cmd_open(GID, UID, UNAME, text)
+
+        app.cmd_order(GID, UID, UNAME, "+1 3")
+        result = app.cmd_order(GID, UID2, UNAME2, "+1 3")
+        assert "剩餘 2 份" in result
+        assert "無法再加 3 份" in result
+
+    def test_all_limited_auto_close(self):
+        """全部品項都有限量且額滿→自動結團"""
+        text = "#開團\n冰品團購\n1) 新鮮冰花 200元 限量2組\n2) 芒果冰 150元 限量3組"
+        app.cmd_open(GID, UID, UNAME, text)
+
+        app.cmd_order(GID, UID, UNAME, "+1 2")
+        # 品項2還沒滿，不應結團
+        buys = app.get_active_buys(GID)
+        assert len(buys) == 1
+
+        result = app.cmd_order(GID, UID, UNAME, "+2 3")
+        assert "自動結團" in result
+
+        buys = app.get_active_buys(GID)
+        assert len(buys) == 0  # 已結團
+
+    def test_mixed_limit_no_auto_close(self):
+        """部分品項限量且額滿，部分不限量→不結團"""
+        text = "#開團\n冰品團購\n1) 新鮮冰花 200元 限量2組\n2) 芒果冰 150元"
+        app.cmd_open(GID, UID, UNAME, text)
+
+        # 品項1額滿
+        app.cmd_order(GID, UID, UNAME, "+1 2")
+
+        # 不應結團（品項2無限量）
+        buys = app.get_active_buys(GID)
+        assert len(buys) == 1
+
+    def test_global_limit_all_items(self):
+        """#開團 限量5份→每品項都 limit=5"""
+        text = "#開團 限量5份\n今日美食\n1) 水餃 50元\n2) 蛋餃 60元\n3) 魚餃 70元"
+        app.cmd_open(GID, UID, UNAME, text)
+
+        buys = app.get_active_buys(GID)
+        items = app.get_items(buys[0][0])
+        assert items[0][5] == 5
+        assert items[1][5] == 5
+        assert items[2][5] == 5
