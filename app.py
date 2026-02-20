@@ -56,6 +56,8 @@ HELP_TEXT = """📖 團購指令說明
 ━━━━━━━━━━━━━━
 【團主開團】
 #開團 + 商品列表（多行貼文）
+#開團 限量20份 + 商品列表
+　（限量開團，額滿自動結團）
 
 【下單方式】
 #N 數量　　　　　下單品項N指定數量
@@ -71,6 +73,7 @@ HELP_TEXT = """📖 團購指令說明
 退出 N　　　　　 取消品項N的訂單
 退出 N 名字　　　取消指定人的訂單
 列表　　　　　　　查看所有下單狀況
+列表 N　　　　　 查看指定團購
 我的訂單　　　　　查看自己的訂單
 統計　　　　　　　AI 智能訂單統計
 團購說明　　　　　顯示本說明
@@ -82,7 +85,13 @@ HELP_TEXT = """📖 團購指令說明
 ━━━━━━━━━━━━━━
 【團主專用】
 結團　　　　　　　封存最終訂單
-取消團購　　　　　刪除所有資料"""
+結團 N　　　　　 結束指定團購
+取消團購　　　　　刪除所有資料
+取消團購 N　　　 取消指定團購
+
+【多團購】
+同一群組可同時開多個團購
+品名下單自動比對所有進行中團購"""
 
 
 # ══════════════════════════════════════════
@@ -111,7 +120,9 @@ def init_db():
             creator_id    TEXT    NOT NULL,
             creator_name  TEXT,
             status        TEXT    DEFAULT 'open',
-            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            buy_num       INTEGER DEFAULT 1,
+            max_quantity  INTEGER
         )
     """)
     c.execute("""
@@ -138,6 +149,13 @@ def init_db():
         )
     """)
 
+    # 遷移：為已存在的 DB 加入新欄位
+    for col, col_def in [('buy_num', 'INTEGER DEFAULT 1'), ('max_quantity', 'INTEGER')]:
+        try:
+            c.execute(f"ALTER TABLE group_buys ADD COLUMN {col} {col_def}")
+        except Exception:
+            pass
+
     conn.commit()
     conn.close()
 
@@ -146,18 +164,47 @@ def init_db():
 # 資料庫輔助函式
 # ══════════════════════════════════════════
 
-def get_active_buy(group_id):
-    """取得群組中目前進行中的團購"""
+def get_active_buys(group_id):
+    """取得群組中所有進行中的團購，ORDER BY buy_num"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
-        'SELECT * FROM group_buys WHERE group_id=? AND status="open" ORDER BY id DESC LIMIT 1',
+        'SELECT * FROM group_buys WHERE group_id=? AND status="open" ORDER BY buy_num',
         (group_id,),
     )
-    row = c.fetchone()
+    rows = c.fetchall()
     conn.close()
-    # cols: id, group_id, title, description, creator_id, creator_name, status, created_at
-    return row
+    # cols: id, group_id, title, description, creator_id, creator_name, status, created_at, buy_num, max_quantity
+    return rows
+
+
+def get_active_buy(group_id, buy_num=None):
+    """取得群組中目前進行中的團購（向下相容）
+    buy_num 指定 → 回傳該筆
+    buy_num=None + 只有1個 → 回傳那個
+    buy_num=None + 0或多個 → 回傳 None
+    """
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    if buy_num is not None:
+        c.execute(
+            'SELECT * FROM group_buys WHERE group_id=? AND status="open" AND buy_num=?',
+            (group_id, buy_num),
+        )
+        row = c.fetchone()
+        conn.close()
+        return row
+    else:
+        c.execute(
+            'SELECT * FROM group_buys WHERE group_id=? AND status="open"',
+            (group_id,),
+        )
+        rows = c.fetchall()
+        conn.close()
+        if len(rows) == 1:
+            return rows[0]
+        return None
+    # cols: id, group_id, title, description, creator_id, creator_name, status, created_at, buy_num, max_quantity
 
 
 def get_items(group_buy_id):
@@ -261,6 +308,144 @@ def calculate_amount(price_info, quantity):
     return total
 
 
+def resolve_buy_for_item(group_id, item_num):
+    """搜尋所有 active buys，找哪個有 item_num
+    回傳 (buy_row, err_msg)
+    唯一匹配 → (buy, None)
+    多個匹配 → (None, 提示訊息)
+    無匹配 → (None, "沒有品項【N】")
+    無團購 → (None, None)
+    """
+    buys = get_active_buys(group_id)
+    if not buys:
+        return (None, None)
+
+    matched = []
+    for buy in buys:
+        buy_id = buy[0]
+        name = get_item_name(buy_id, item_num)
+        if name:
+            matched.append(buy)
+
+    if len(matched) == 1:
+        return (matched[0], None)
+    elif len(matched) > 1:
+        hints = []
+        for buy in matched:
+            buy_num = buy[8]
+            name = get_item_name(buy[0], item_num)
+            hints.append(f"  團購{buy_num}：{name}")
+        return (None, f"⚠️ 多個團購都有品項【{item_num}】，請用品名下單：\n" + '\n'.join(hints))
+    else:
+        return (None, f"⚠️ 沒有品項【{item_num}】，請確認編號。")
+
+
+def check_auto_close(buy_id, group_id):
+    """檢查是否達到數量上限，若達到則自動結團
+    回傳結團公告字串，或 None
+    """
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT max_quantity, buy_num, title FROM group_buys WHERE id=?', (buy_id,))
+    row = c.fetchone()
+    if not row or row[0] is None:
+        conn.close()
+        return None
+
+    max_qty = row[0]
+    buy_num = row[1]
+    title = row[2]
+
+    c.execute('SELECT COALESCE(SUM(quantity), 0) FROM orders WHERE group_buy_id=?', (buy_id,))
+    total = c.fetchone()[0]
+
+    if total >= max_qty:
+        c.execute("UPDATE group_buys SET status='closed' WHERE id=?", (buy_id,))
+        conn.commit()
+        conn.close()
+
+        # 產生結團公告
+        buy_list = format_buy_list(buy_id, show_label=True)
+        return f"\n\n🔒 已達限量 {max_qty} 份，自動結團！\n\n{buy_list}"
+    else:
+        conn.close()
+        remaining = max_qty - total
+        return f"\n📊 已訂 {total}/{max_qty} 份（剩餘 {remaining} 份）"
+
+
+def format_buy_list(buy_id, show_label=False):
+    """格式化單一團購訂單列表"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT title, buy_num, max_quantity FROM group_buys WHERE id=?', (buy_id,))
+    buy_row = c.fetchone()
+    conn.close()
+    if not buy_row:
+        return ""
+
+    title = buy_row[0]
+    buy_num = buy_row[1]
+    max_qty = buy_row[2]
+
+    items = get_items(buy_id)
+    orders = get_orders(buy_id)
+
+    # 按品項分組訂單
+    orders_by_item = {}
+    for o in orders:
+        orders_by_item.setdefault(o[2], []).append(o)
+
+    label = f"[團購{buy_num}] " if show_label else ""
+    qty_info = f"（限量 {max_qty} 份）" if max_qty else ""
+    lines = [f"🛒 {label}{title}{qty_info}", "────────────────"]
+    total_orders = 0
+    total_amount = 0
+    has_price = False
+
+    for item in items:
+        item_num = item[2]
+        price_info = item[4] or item[3]
+
+        info_lines = price_info.split('\n')
+        lines.append(f"【{item_num}】{info_lines[0]}")
+        for extra in info_lines[1:]:
+            lines.append(f"　　{extra}")
+
+        item_orders = orders_by_item.get(item_num, [])
+        if item_orders:
+            subtotal = 0
+            item_amount = 0
+            for o in item_orders:
+                name = o[4] or "（未知）"
+                qty = o[5]
+                subtotal += qty
+                person_amount = calculate_amount(price_info, qty)
+                if person_amount:
+                    lines.append(f"   👤 {name} x{qty}　💰{person_amount}元")
+                    item_amount += person_amount
+                else:
+                    lines.append(f"   👤 {name} x{qty}")
+            total_orders += subtotal
+            item_amount_str = ""
+            if item_amount:
+                total_amount += item_amount
+                has_price = True
+                item_amount_str = f"　💰{item_amount}元"
+            lines.append(f"   小計：{subtotal} 份{item_amount_str}")
+        else:
+            lines.append("   （尚無人下單）")
+
+        lines.append("")
+
+    lines.append("────────────────")
+    summary = f"共 {total_orders} 份訂單"
+    if has_price:
+        summary += f"　💰總金額：{total_amount} 元"
+    lines.append(summary)
+
+    return '\n'.join(lines)
+
+
 # ══════════════════════════════════════════
 # 通用輔助函式
 # ══════════════════════════════════════════
@@ -310,9 +495,9 @@ def parse_group_buy(text):
     """
     lines = text.split('\n')
 
-    # 跳過第一行的「#開團」或「開團」字樣
+    # 跳過第一行的「#開團」或「開團」字樣（含可能的限量參數）
     start = 0
-    if lines and re.match(r'^\s*#?開團\s*$', lines[0]):
+    if lines and re.match(r'^\s*#?開團', lines[0]):
         start = 1
 
     # 找出所有品項的起始行
@@ -366,27 +551,34 @@ def parse_group_buy(text):
 # ══════════════════════════════════════════
 
 def cmd_open(group_id, user_id, user_name, text):
-    """開團：解析貼文建立團購"""
-    # 檢查是否已有進行中的團購
-    active = get_active_buy(group_id)
-    if active:
-        return f"⚠️ 目前已有進行中的團購：{active[2]}\n請先「結團」或「取消團購」再開新團。"
-
-    # 移除開頭的「#開團」或「開團」
-    post_text = re.sub(r'^\s*#?開團\s*\n?', '', text, count=1).strip()
+    """開團：解析貼文建立團購（允許同群組多團購）"""
     full_text = text  # 保留原始完整貼文
+
+    # 解析限量數量
+    max_quantity = None
+    limit_m = re.search(r'限量\s*(\d+)\s*[份個]?', text)
+    if limit_m:
+        max_quantity = int(limit_m.group(1))
 
     title, items_list = parse_group_buy(text)
 
     if not items_list:
         return "⚠️ 無法解析品項，請確認格式：\n#開團\n標題\n1) 品名 價格\n2) 品名 價格"
 
-    # 寫入資料庫
+    # 計算 buy_num = 群組內最大 buy_num + 1
+    existing_buys = get_active_buys(group_id)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
-        "INSERT INTO group_buys (group_id, title, description, creator_id, creator_name) VALUES (?, ?, ?, ?, ?)",
-        (group_id, title, full_text, user_id, user_name),
+        "SELECT COALESCE(MAX(buy_num), 0) FROM group_buys WHERE group_id=?",
+        (group_id,),
+    )
+    max_num = c.fetchone()[0]
+    buy_num = max_num + 1
+
+    c.execute(
+        "INSERT INTO group_buys (group_id, title, description, creator_id, creator_name, buy_num, max_quantity) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (group_id, title, full_text, user_id, user_name, buy_num, max_quantity),
     )
     buy_id = c.lastrowid
 
@@ -399,35 +591,54 @@ def cmd_open(group_id, user_id, user_name, text):
     conn.commit()
     conn.close()
 
+    # 多團購時顯示標籤
+    other_buys = [b for b in existing_buys]  # existing_buys 是開團前的 active buys
+    show_label = len(other_buys) > 0
+    label = f"[團購{buy_num}] " if show_label else ""
+
     # 組合回覆
-    lines = [f"🛒 開團成功！{title}", "────────────────"]
+    lines = [f"🛒 開團成功！{label}{title}", "────────────────"]
     for item_num, name, price_info in items_list:
-        # 顯示完整 price_info（多行品項資訊）
         info_lines = price_info.split('\n')
         lines.append(f"【{item_num}】{info_lines[0]}")
         for extra in info_lines[1:]:
             lines.append(f"　　{extra}")
     lines.append("────────────────")
+
+    if max_quantity:
+        lines.append(f"⚠️ 限量 {max_quantity} 份，額滿自動結團")
+
     lines.append("下單方式：#品項編號")
     lines.append("例如：#1 或 #1 2（2份）")
+
+    total_active = len(other_buys) + 1
+    if total_active > 1:
+        lines.append(f"\n📌 目前共有 {total_active} 個團購進行中")
 
     return '\n'.join(lines)
 
 
-def cmd_order(group_id, user_id, user_name, text):
+def cmd_order(group_id, user_id, user_name, text, target_buy=None):
     """下單：+N / +N 數量 / +N 名字 / +N 名字 數量"""
-    active = get_active_buy(group_id)
-    if not active:
-        return None  # 沒有進行中的團購，靜默
-
-    buy_id = active[0]
-
     # 解析指令
     m = re.match(r'\+(\d+)(?:\s+(.*))?$', text)
     if not m:
         return None
     item_num = int(m.group(1))
     rest = m.group(2).strip() if m.group(2) else ""
+
+    # 決定目標團購
+    if target_buy:
+        active = target_buy
+    else:
+        active, err = resolve_buy_for_item(group_id, item_num)
+        if err:
+            return err
+        if not active:
+            return None  # 沒有進行中的團購，靜默
+
+    buy_id = active[0]
+    buy_num = active[8]
 
     # 確認品項存在
     item_name = get_item_name(buy_id, item_num)
@@ -495,20 +706,25 @@ def cmd_order(group_id, user_id, user_name, text):
     conn.commit()
     conn.close()
 
+    # 多團購時顯示標籤
+    multi = len(get_active_buys(group_id)) > 1
+    label = f"[團購{buy_num}] " if multi else ""
+
     if explicit_qty and existing:
-        return f"✅ {order_name}【{item_num}】{item_name} → {total} 份"
+        result = f"✅ {label}{order_name}【{item_num}】{item_name} → {total} 份"
     else:
-        return f"✅ {order_name}【{item_num}】{item_name} +{quantity}份（共 {total} 份）"
+        result = f"✅ {label}{order_name}【{item_num}】{item_name} +{quantity}份（共 {total} 份）"
+
+    # 檢查自動結團
+    auto_close = check_auto_close(buy_id, group_id)
+    if auto_close:
+        result += auto_close
+
+    return result
 
 
-def cmd_order_multi(group_id, user_id, user_name, text):
+def cmd_order_multi(group_id, user_id, user_name, text, target_buy=None):
     """多品項下單：+1 +3 +5 名字"""
-    active = get_active_buy(group_id)
-    if not active:
-        return None
-
-    buy_id = active[0]
-
     # 提取所有 +N
     item_nums = [int(x) for x in re.findall(r'\+(\d+)', text)]
 
@@ -518,7 +734,22 @@ def cmd_order_multi(group_id, user_id, user_name, text):
     registered_by = user_name if rest else None
 
     results = []
+    affected_buys = set()
     for item_num in item_nums:
+        # 決定目標團購
+        if target_buy:
+            active = target_buy
+        else:
+            active, err = resolve_buy_for_item(group_id, item_num)
+            if err:
+                results.append(err)
+                continue
+            if not active:
+                return None
+
+        buy_id = active[0]
+        buy_num = active[8]
+
         item_name = get_item_name(buy_id, item_num)
         if not item_name:
             results.append(f"⚠️ 沒有品項【{item_num}】")
@@ -546,29 +777,43 @@ def cmd_order_multi(group_id, user_id, user_name, text):
 
         conn.commit()
         conn.close()
-        results.append(f"✅ {order_name}【{item_num}】{item_name}（共 {total} 份）")
 
-    return '\n'.join(results)
+        multi = len(get_active_buys(group_id)) > 1
+        label = f"[團購{buy_num}] " if multi else ""
+        results.append(f"✅ {label}{order_name}【{item_num}】{item_name}（共 {total} 份）")
+        affected_buys.add(buy_id)
+
+    # 檢查所有涉及的團購是否需要自動結團
+    for bid in affected_buys:
+        auto_close = check_auto_close(bid, group_id)
+        if auto_close and '自動結團' in auto_close:
+            results.append(auto_close)
+
+    return '\n'.join(results) if results else None
 
 
 def cmd_batch_order(group_id, user_id, user_name, text):
     """批次下單：Name|item×qty、item×qty 或 Name item×qty、... 或 item×qty、..."""
-    active = get_active_buy(group_id)
-    if not active:
+    # 搜尋所有 active buys 的品項
+    buys = get_active_buys(group_id)
+    if not buys:
         return None
 
-    buy_id = active[0]
-    items = get_items(buy_id)
-    if not items:
+    all_items = []  # [(buy_row, item_row), ...]
+    for buy in buys:
+        for item in get_items(buy[0]):
+            all_items.append((buy, item))
+
+    if not all_items:
         return None
 
     def find_match(search):
-        """在品項中找匹配（子字串比對）"""
-        for item in items:
+        """在所有團購品項中找匹配（子字串比對），回傳 (buy, item)"""
+        for buy, item in all_items:
             item_name = item[3]
             price_info = item[4] or ""
             if search in item_name or search in price_info:
-                return item
+                return (buy, item)
         return None
 
     # 判斷是否有代訂人（以 | 分隔）
@@ -588,6 +833,7 @@ def cmd_batch_order(group_id, user_id, user_name, text):
     results = []
     success_count = 0
     detected_proxy = None  # 從第一個 entry 偵測到的代訂人名
+    affected_buys = set()
 
     for entry in item_entries:
         entry = entry.strip()
@@ -611,30 +857,30 @@ def cmd_batch_order(group_id, user_id, user_name, text):
             continue
 
         # 在品項中找匹配
-        matched_item = find_match(search_name)
+        matched = find_match(search_name)
 
         # 沒找到且沒有 | 分隔 → 嘗試移除前導詞作為代訂人名
-        # 例如「秋蘭 麻油猴頭菇」→ 代訂人=秋蘭，品名=麻油猴頭菇
         proxy_name = None
-        if not matched_item and '|' not in text:
+        if not matched and '|' not in text:
             words = search_name.split()
             for i in range(1, len(words)):
                 shorter = ''.join(words[i:])
-                matched_item = find_match(shorter)
-                if not matched_item:
+                matched = find_match(shorter)
+                if not matched:
                     shorter = ' '.join(words[i:])
-                    matched_item = find_match(shorter)
-                if matched_item:
+                    matched = find_match(shorter)
+                if matched:
                     proxy_name = ''.join(words[:i])
                     break
 
         if proxy_name:
             detected_proxy = proxy_name
 
-        if not matched_item:
+        if not matched:
             results.append(f"⚠️ 找不到品項「{search_name}」")
             continue
 
+        matched_buy, matched_item = matched
         item_num = matched_item[2]
 
         # 決定下單用的名字
@@ -646,10 +892,11 @@ def cmd_batch_order(group_id, user_id, user_name, text):
         else:
             order_text = f"+{item_num} {qty}"
 
-        order_result = cmd_order(group_id, user_id, user_name, order_text)
+        order_result = cmd_order(group_id, user_id, user_name, order_text, target_buy=matched_buy)
         if order_result:
             results.append(order_result)
             success_count += 1
+            affected_buys.add(matched_buy[0])
 
     # 沒有任何成功的訂單 → 回傳 None，讓 NLU 接手
     if success_count == 0:
@@ -659,17 +906,20 @@ def cmd_batch_order(group_id, user_id, user_name, text):
 
 def cmd_cancel_order(group_id, user_id, user_name, text):
     """退出：退出 N / 退出 N 名字"""
-    active = get_active_buy(group_id)
-    if not active:
-        return None
-
-    buy_id = active[0]
-
     m = re.match(r'退出\s+(\d+)(?:\s+(\S+))?', text)
     if not m:
         return None
     item_num = int(m.group(1))
     target_name = m.group(2)
+
+    # 用 resolve_buy_for_item 找到品項所在的 buy
+    active, err = resolve_buy_for_item(group_id, item_num)
+    if err:
+        return err
+    if not active:
+        return None
+
+    buy_id = active[0]
 
     # 確認品項存在
     item_name = get_item_name(buy_id, item_num)
@@ -710,147 +960,126 @@ def cmd_cancel_order(group_id, user_id, user_name, text):
         return f"❌ 已取消【{item_num}】{item_name} 的訂單"
 
 
-def cmd_list(group_id):
+def cmd_list(group_id, buy_num=None):
     """列表：查看所有下單狀況"""
-    active = get_active_buy(group_id)
-    if not active:
+    if buy_num is not None:
+        # 指定團購編號
+        active = get_active_buy(group_id, buy_num)
+        if not active:
+            return f"⚠️ 沒有團購{buy_num}，或已結團。"
+        return format_buy_list(active[0], show_label=True)
+
+    buys = get_active_buys(group_id)
+    if not buys:
         return "目前沒有進行中的團購。"
 
-    buy_id = active[0]
-    title = active[2]
-    items = get_items(buy_id)
-    orders = get_orders(buy_id)
+    if len(buys) == 1:
+        return format_buy_list(buys[0][0], show_label=False)
 
-    # 按品項分組訂單
-    orders_by_item = {}
-    for o in orders:
-        # o: id, group_buy_id, item_num, user_id, user_name, quantity, registered_by, created_at
-        orders_by_item.setdefault(o[2], []).append(o)
-
-    lines = [f"🛒 {title}", "────────────────"]
-    total_orders = 0
-    total_amount = 0
-    has_price = False
-
-    for item in items:
-        # item: id, group_buy_id, item_num, name, price_info
-        item_num = item[2]
-        price_info = item[4] or item[3]
-
-        # 顯示品項（含完整價格資訊）
-        info_lines = price_info.split('\n')
-        lines.append(f"【{item_num}】{info_lines[0]}")
-        for extra in info_lines[1:]:
-            lines.append(f"　　{extra}")
-
-        item_orders = orders_by_item.get(item_num, [])
-        if item_orders:
-            subtotal = 0
-            item_amount = 0
-            for o in item_orders:
-                name = o[4] or "（未知）"
-                qty = o[5]
-                subtotal += qty
-                # 階梯價按每個人的數量計算
-                person_amount = calculate_amount(price_info, qty)
-                if person_amount:
-                    lines.append(f"   👤 {name} x{qty}　💰{person_amount}元")
-                    item_amount += person_amount
-                else:
-                    lines.append(f"   👤 {name} x{qty}")
-            total_orders += subtotal
-            item_amount_str = ""
-            if item_amount:
-                total_amount += item_amount
-                has_price = True
-                item_amount_str = f"　💰{item_amount}元"
-            lines.append(f"   小計：{subtotal} 份{item_amount_str}")
-        else:
-            lines.append("   （尚無人下單）")
-
-        lines.append("")  # 空行分隔
-
-    lines.append("────────────────")
-    summary = f"共 {total_orders} 份訂單"
-    if has_price:
-        summary += f"　💰總金額：{total_amount} 元"
-    lines.append(summary)
-
-    return '\n'.join(lines)
+    # 多個團購：每個用 format_buy_list 顯示
+    parts = []
+    for buy in buys:
+        parts.append(format_buy_list(buy[0], show_label=True))
+    return '\n\n'.join(parts)
 
 
 def cmd_my_orders(group_id, user_id, user_name):
-    """我的訂單：查看自己的下單（含代訂）"""
-    active = get_active_buy(group_id)
-    if not active:
+    """我的訂單：查看自己的下單（含代訂），跨所有 active buys"""
+    buys = get_active_buys(group_id)
+    if not buys:
         return "目前沒有進行中的團購。"
 
-    buy_id = active[0]
-    title = active[2]
     my_name = user_name or "（未知）"
+    multi = len(buys) > 1
+    all_lines = [f"👤 {my_name} 的訂單", "────────────────"]
+    grand_total = 0
+    has_any = False
 
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    for buy in buys:
+        buy_id = buy[0]
+        title = buy[2]
+        buy_num = buy[8]
 
-    # 自己的訂單（user_id 比對，排除代訂）
-    c.execute(
-        "SELECT item_num, user_name, quantity FROM orders WHERE group_buy_id=? AND user_id=? AND registered_by IS NULL ORDER BY item_num",
-        (buy_id, user_id),
-    )
-    own_orders = c.fetchall()
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
 
-    # 幫別人代訂的（registered_by 不為空，且 user_id 是自己）
-    c.execute(
-        "SELECT item_num, user_name, quantity FROM orders WHERE group_buy_id=? AND user_id=? AND registered_by IS NOT NULL ORDER BY item_num",
-        (buy_id, user_id),
-    )
-    proxy_orders = c.fetchall()
+        c.execute(
+            "SELECT item_num, user_name, quantity FROM orders WHERE group_buy_id=? AND user_id=? AND registered_by IS NULL ORDER BY item_num",
+            (buy_id, user_id),
+        )
+        own_orders = c.fetchall()
 
-    conn.close()
+        c.execute(
+            "SELECT item_num, user_name, quantity FROM orders WHERE group_buy_id=? AND user_id=? AND registered_by IS NOT NULL ORDER BY item_num",
+            (buy_id, user_id),
+        )
+        proxy_orders = c.fetchall()
 
-    if not own_orders and not proxy_orders:
-        return f"📋 {title}\n你目前沒有下單。"
+        conn.close()
 
-    lines = [f"📋 {title}", f"👤 {my_name} 的訂單", "────────────────"]
+        if not own_orders and not proxy_orders:
+            continue
 
-    for item_num, name, qty in own_orders:
-        item_name = get_item_name(buy_id, item_num) or f"品項{item_num}"
-        lines.append(f"【{item_num}】{item_name} x{qty}")
+        has_any = True
+        label = f"[團購{buy_num}] " if multi else "📋 "
+        all_lines.append(f"{label}{title}")
 
-    if proxy_orders:
-        lines.append("")
-        lines.append("📦 代訂：")
-        for item_num, name, qty in proxy_orders:
+        for item_num, name, qty in own_orders:
             item_name = get_item_name(buy_id, item_num) or f"品項{item_num}"
-            lines.append(f"【{item_num}】{item_name} x{qty}（{name}）")
+            all_lines.append(f"【{item_num}】{item_name} x{qty}")
 
-    lines.append("────────────────")
-    total = len(own_orders) + len(proxy_orders)
-    lines.append(f"共 {total} 項")
+        if proxy_orders:
+            all_lines.append("📦 代訂：")
+            for item_num, name, qty in proxy_orders:
+                item_name = get_item_name(buy_id, item_num) or f"品項{item_num}"
+                all_lines.append(f"【{item_num}】{item_name} x{qty}（{name}）")
 
-    return '\n'.join(lines)
+        buy_total = len(own_orders) + len(proxy_orders)
+        grand_total += buy_total
+        if multi:
+            all_lines.append("")
+
+    if not has_any:
+        return "你目前沒有下單。"
+
+    all_lines.append("────────────────")
+    all_lines.append(f"共 {grand_total} 項")
+
+    return '\n'.join(all_lines)
 
 
-def cmd_close(group_id, user_id):
+def cmd_close(group_id, user_id, buy_num=None):
     """結團：封存訂單（僅團主可用）"""
-    active = get_active_buy(group_id)
-    if not active:
+    buys = get_active_buys(group_id)
+    if not buys:
         return "目前沒有進行中的團購。"
+
+    if buy_num is not None:
+        active = get_active_buy(group_id, buy_num)
+        if not active:
+            return f"⚠️ 沒有團購{buy_num}，或已結團。"
+    elif len(buys) == 1:
+        active = buys[0]
+    else:
+        # 多個團購，需指定
+        hints = [f"  團購{b[8]}：{b[2]}" for b in buys]
+        return "⚠️ 目前有多個團購進行中，請指定：\n" + '\n'.join(hints) + "\n\n例如：結團 1"
 
     buy_id = active[0]
     title = active[2]
     creator_id = active[4]
+    bn = active[8]
 
     if user_id != creator_id:
         return "⚠️ 只有團主可以結團。"
 
     # 先產生最終列表
-    final_list = cmd_list(group_id)
+    final_list = format_buy_list(buy_id, show_label=(len(buys) > 1))
 
-    # AI 結單報告（在 status 更新前呼叫，因為更新後 get_active_buy 就找不到了）
+    # AI 結單報告
     ai_report = ""
     try:
-        ai_summary = cmd_ai_summary(group_id)
+        ai_summary = cmd_ai_summary(group_id, buy_num=bn)
         if ai_summary and not ai_summary.startswith("⚠️"):
             ai_report = f"\n\n{ai_summary}"
     except Exception as e:
@@ -866,11 +1095,21 @@ def cmd_close(group_id, user_id):
     return f"🔒 團購已結團！\n\n{final_list}{ai_report}"
 
 
-def cmd_cancel_buy(group_id, user_id):
+def cmd_cancel_buy(group_id, user_id, buy_num=None):
     """取消團購：刪除所有資料（僅團主可用）"""
-    active = get_active_buy(group_id)
-    if not active:
+    buys = get_active_buys(group_id)
+    if not buys:
         return "目前沒有進行中的團購。"
+
+    if buy_num is not None:
+        active = get_active_buy(group_id, buy_num)
+        if not active:
+            return f"⚠️ 沒有團購{buy_num}，或已結團。"
+    elif len(buys) == 1:
+        active = buys[0]
+    else:
+        hints = [f"  團購{b[8]}：{b[2]}" for b in buys]
+        return "⚠️ 目前有多個團購進行中，請指定：\n" + '\n'.join(hints) + "\n\n例如：取消團購 1"
 
     buy_id = active[0]
     title = active[2]
@@ -986,21 +1225,26 @@ def cmd_nlu_order(group_id, user_id, user_name, text):
     if not claude_client:
         return None
 
-    active = get_active_buy(group_id)
-    if not active:
+    buys = get_active_buys(group_id)
+    if not buys:
         return None
 
-    buy_id = active[0]
-    title = active[2]
-    items = get_items(buy_id)
-    orders = get_orders(buy_id)
+    # 收集所有 active buys 的品項和訂單（供 NLU 使用）
+    all_items = []
+    all_orders = []
+    title_parts = []
+    for buy in buys:
+        bid = buy[0]
+        title_parts.append(buy[2])
+        all_items.extend(get_items(bid))
+        all_orders.extend(get_orders(bid))
 
     # 預先過濾
-    if not is_possibly_order_related(text, items):
+    if not is_possibly_order_related(text, all_items):
         return None
 
-    # 呼叫 Claude
-    prompt = build_nlu_prompt(title, items, orders, user_name, text)
+    combined_title = ' / '.join(title_parts)
+    prompt = build_nlu_prompt(combined_title, all_items, all_orders, user_name, text)
     try:
         message = claude_client.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -1010,14 +1254,13 @@ def cmd_nlu_order(group_id, user_id, user_name, text):
         )
         result_text = message.content[0].text.strip()
 
-        # 解析 JSON（處理可能的 markdown code block）
         if result_text.startswith("```"):
             result_text = result_text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
         result = json.loads(result_text)
 
     except Exception as e:
         logger.error(f"[nlu] Claude 呼叫或解析失敗: {e}")
-        return None  # 失敗就靜默，不影響正常使用
+        return None
 
     action = result.get("action")
 
@@ -1032,19 +1275,16 @@ def cmd_nlu_order(group_id, user_id, user_name, text):
         quantity = result.get("quantity", 1)
         for_name = result.get("for_name")
 
-        # 驗證品項存在
-        item_name = get_item_name(buy_id, item_num)
-        if not item_name:
-            return f"🤔 找不到品項【{item_num}】，請確認編號。\n輸入「列表」查看所有品項。"
-
-        # 組合標準下單指令，複用現有 cmd_order
         if for_name:
             order_text = f"+{item_num} {for_name} {quantity}"
         else:
             order_text = f"+{item_num} {quantity}"
 
+        # cmd_order 內部會用 resolve_buy_for_item 找到正確的團購
         order_result = cmd_order(group_id, user_id, user_name, order_text)
-        return f"🤖 AI 理解：{order_result}"
+        if order_result:
+            return f"🤖 AI 理解：{order_result}"
+        return f"🤔 找不到品項【{item_num}】，請確認編號。\n輸入「列表」查看所有品項。"
 
     elif action == "cancel":
         item_num = result.get("item_num")
@@ -1063,51 +1303,59 @@ def cmd_nlu_order(group_id, user_id, user_name, text):
         quantity = result.get("quantity", 1)
         for_name = result.get("for_name")
 
-        item_name = get_item_name(buy_id, item_num)
-        if not item_name:
-            return f"🤔 找不到品項【{item_num}】，請確認編號。"
-
         if for_name:
             order_text = f"+{item_num} {for_name} {quantity}"
         else:
             order_text = f"+{item_num} {quantity}"
 
         order_result = cmd_order(group_id, user_id, user_name, order_text)
-        return f"🤖 AI 理解（修改數量）：{order_result}"
+        if order_result:
+            return f"🤖 AI 理解（修改數量）：{order_result}"
+        return f"🤔 找不到品項【{item_num}】，請確認編號。"
 
     return None
 
 
-def cmd_ai_summary(group_id):
+def cmd_ai_summary(group_id, buy_num=None):
     """AI 智能訂單統計"""
     if not claude_client:
         return "⚠️ AI 功能未啟用（ANTHROPIC_API_KEY 未設定）"
 
-    active = get_active_buy(group_id)
-    if not active:
-        return "目前沒有進行中的團購。"
+    if buy_num is not None:
+        active = get_active_buy(group_id, buy_num)
+        if not active:
+            return f"⚠️ 沒有團購{buy_num}，或已結團。"
+        targets = [active]
+    else:
+        buys = get_active_buys(group_id)
+        if not buys:
+            return "目前沒有進行中的團購。"
+        targets = buys
 
-    buy_id = active[0]
-    title = active[2]
-    items = get_items(buy_id)
-    orders = get_orders(buy_id)
+    all_results = []
+    for active in targets:
+        bid = active[0]
+        title = active[2]
+        bn = active[8]
+        items = get_items(bid)
+        orders = get_orders(bid)
 
-    if not orders:
-        return f"📋 {title}\n目前還沒有人下單。"
+        if not orders:
+            all_results.append(f"📋 {title}\n目前還沒有人下單。")
+            continue
 
-    # 組合訂單資料
-    items_text = ""
-    for item in items:
-        price = extract_price(item[4])
-        price_str = f" - 單價 {price} 元" if price else ""
-        items_text += f"  {item[2]}. {item[3]}{price_str}\n"
+        items_text = ""
+        for item in items:
+            price = extract_price(item[4])
+            price_str = f" - 單價 {price} 元" if price else ""
+            items_text += f"  {item[2]}. {item[3]}{price_str}\n"
 
-    orders_text = ""
-    for o in orders:
-        item_name = get_item_name(buy_id, o[2]) or f"品項{o[2]}"
-        orders_text += f"  - {o[4]}: {item_name}(品項{o[2]}) x{o[5]}\n"
+        orders_text = ""
+        for o in orders:
+            item_name = get_item_name(bid, o[2]) or f"品項{o[2]}"
+            orders_text += f"  - {o[4]}: {item_name}(品項{o[2]}) x{o[5]}\n"
 
-    prompt = f"""以下是團購「{title}」的訂單資料，請做統計分析：
+        prompt = f"""以下是團購「{title}」的訂單資料，請做統計分析：
 
 【品項列表】
 {items_text}
@@ -1120,12 +1368,14 @@ def cmd_ai_summary(group_id):
 
 格式要求：簡潔清楚，適合 LINE 群組顯示，用 emoji 和分隔線排版。"""
 
-    result = call_claude(prompt)
-    if result:
-        return f"🤖 AI 統計分析\n━━━━━━━━━━━━━━\n{result}"
-    else:
-        # fallback：回傳現有的列表功能
-        return cmd_list(group_id)
+        result = call_claude(prompt)
+        if result:
+            label = f"[團購{bn}] " if len(targets) > 1 else ""
+            all_results.append(f"🤖 AI 統計分析 {label}\n━━━━━━━━━━━━━━\n{result}")
+        else:
+            all_results.append(cmd_list(group_id, buy_num=bn))
+
+    return '\n\n'.join(all_results)
 
 
 # ══════════════════════════════════════════
@@ -1196,11 +1446,13 @@ def handle_message(event):
 
     # ── 單獨 #N（無數量無名字）→ 不動作，提示補充數量
     elif re.match(r'^[+#]\d+\s*$', text):
-        active = get_active_buy(gid)
-        if active:
-            m = re.match(r'^[+#](\d+)', text)
-            item_num = int(m.group(1))
-            item_name = get_item_name(active[0], item_num)
+        m = re.match(r'^[+#](\d+)', text)
+        item_num = int(m.group(1))
+        buy, err = resolve_buy_for_item(gid, item_num)
+        if err:
+            reply = err
+        elif buy:
+            item_name = get_item_name(buy[0], item_num)
             if item_name:
                 reply = f"📝【{item_num}】{item_name}\n請輸入數量，例如：#{item_num} 1份"
 
@@ -1212,11 +1464,13 @@ def handle_message(event):
 
     # ── 單獨 N.（無內容）→ 不動作，提示補充數量
     elif re.match(r'^\d+[\.．]\s*$', text):
-        active = get_active_buy(gid)
-        if active:
-            m = re.match(r'^(\d+)', text)
-            item_num = int(m.group(1))
-            item_name = get_item_name(active[0], item_num)
+        m = re.match(r'^(\d+)', text)
+        item_num = int(m.group(1))
+        buy, err = resolve_buy_for_item(gid, item_num)
+        if err:
+            reply = err
+        elif buy:
+            item_name = get_item_name(buy[0], item_num)
             if item_name:
                 reply = f"📝【{item_num}】{item_name}\n請輸入數量，例如：#{item_num} 1份"
 
@@ -1224,25 +1478,33 @@ def handle_message(event):
     elif re.match(r'退出\s+\d+', text):
         reply = cmd_cancel_order(gid, uid, lazy_name(), text)
 
-    # ── 列表
-    elif text in ("列表", "/列表", "查看", "清單"):
-        reply = cmd_list(gid)
+    # ── 列表（支援「列表 N」指定團購）
+    elif re.match(r'^(?:列表|/列表|查看|清單)(?:\s+(\d+))?\s*$', text):
+        m_list = re.match(r'^(?:列表|/列表|查看|清單)\s*(\d+)?', text)
+        bn = int(m_list.group(1)) if m_list.group(1) else None
+        reply = cmd_list(gid, bn)
 
     # ── 我的訂單
     elif text in ("我的訂單", "我的單"):
         reply = cmd_my_orders(gid, uid, lazy_name())
 
-    # ── 結團（團主專用）
-    elif text in ("結團",):
-        reply = cmd_close(gid, uid)
+    # ── 結團（團主專用，支援「結團 N」）
+    elif re.match(r'^結團(?:\s+\d+)?\s*$', text):
+        m_close = re.match(r'^結團\s*(\d+)?', text)
+        bn = int(m_close.group(1)) if m_close.group(1) else None
+        reply = cmd_close(gid, uid, bn)
 
-    # ── 取消團購（團主專用）
-    elif text in ("取消團購",):
-        reply = cmd_cancel_buy(gid, uid)
+    # ── 取消團購（團主專用，支援「取消團購 N」）
+    elif re.match(r'^取消團購(?:\s+\d+)?\s*$', text):
+        m_cancel = re.match(r'^取消團購\s*(\d+)?', text)
+        bn = int(m_cancel.group(1)) if m_cancel.group(1) else None
+        reply = cmd_cancel_buy(gid, uid, bn)
 
-    # ── AI 統計
-    elif text in ("統計", "AI統計", "智能統計"):
-        reply = cmd_ai_summary(gid)
+    # ── AI 統計（支援「統計 N」）
+    elif re.match(r'^(?:統計|AI統計|智能統計)(?:\s+(\d+))?\s*$', text):
+        m_stat = re.match(r'^(?:統計|AI統計|智能統計)\s*(\d+)?', text)
+        bn = int(m_stat.group(1)) if m_stat.group(1) else None
+        reply = cmd_ai_summary(gid, bn)
 
     # ── 團購說明（所有人可用）
     elif text in ("團購說明", "操作說明", "說明"):
