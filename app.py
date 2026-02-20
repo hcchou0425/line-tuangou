@@ -841,7 +841,7 @@ def cmd_batch_order(group_id, user_id, user_name, text):
             continue
 
         # 解析 item_name×qty 或 item_name*qty
-        m = re.match(r'^(.+?)\s*[×xX*]\s*(\d+)\s*[份個包組盒袋條]?\s*$', entry)
+        m = re.match(r'^(.+?)\s*[×xX*+]\s*(\d+)\s*[份個包組盒袋條]?\s*$', entry)
         if not m:
             # 品名直接接數字：麻油猴頭菇2
             m = re.match(r'^(.*[\u4e00-\u9fff\u3400-\u4dbf])\s*(\d+)\s*[份個包組盒袋條]?\s*$', entry)
@@ -1511,7 +1511,7 @@ def handle_message(event):
         reply = HELP_TEXT
 
     # ── 批次下單（品名×數量、品名數量、Name 品名數量 或 Name|品名數量）
-    elif re.search(r'[\u4e00-\u9fff\u3400-\u4dbf）\)]\s*[×xX*]\s*\d', text) or \
+    elif re.search(r'[\u4e00-\u9fff\u3400-\u4dbf）\)]\s*[×xX*+]\s*\d', text) or \
          (('|' in text or '、' in text) and re.search(r'[\u4e00-\u9fff\u3400-\u4dbf]\d', text)) or \
          re.match(r'^[\u4e00-\u9fff\u3400-\u4dbf][\u4e00-\u9fff\u3400-\u4dbf\s]*\d+\s*[份個包組盒袋條]?\s*$', text):
         reply = cmd_batch_order(gid, uid, lazy_name(), text)
