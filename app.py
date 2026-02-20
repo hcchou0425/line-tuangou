@@ -816,6 +816,16 @@ def cmd_batch_order(group_id, user_id, user_name, text):
                 return (buy, item)
         return None
 
+    # 處理換行：Name\nItem+qty 視同 Name|Item+qty
+    if '\n' in text and '|' not in text:
+        first_line = text.split('\n', 1)[0].strip()
+        rest_lines = text.split('\n', 1)[1].strip()
+        # 第一行無數量標記 → 視為代訂人名
+        if first_line and not re.search(r'[×xX*+]\s*\d|\d+\s*[份個包組盒袋條]', first_line):
+            text = first_line + '|' + rest_lines.replace('\n', '、')
+        else:
+            text = text.replace('\n', '、')
+
     # 判斷是否有代訂人（以 | 分隔）
     if '|' in text:
         parts = text.split('|', 1)
