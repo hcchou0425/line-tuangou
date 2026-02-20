@@ -63,7 +63,9 @@ HELP_TEXT = """📖 團購指令說明
 #N 名字　　　　　幫人下單1份
 #N 名字 數量　　 幫人下單指定數量
 #N #M 名字　　　 一次下單多品項
-　（例：#1 2份、#1+2、#1 小明 3份）
+品名×數量、...　　用品名批次下單
+名字|品名×數量　　幫人批次下單
+　（例：#1 2份、水餃×2、小明|水餃×2）
 
 【其他指令】
 退出 N　　　　　 取消品項N的訂單
@@ -547,6 +549,78 @@ def cmd_order_multi(group_id, user_id, user_name, text):
         results.append(f"✅ {order_name}【{item_num}】{item_name}（共 {total} 份）")
 
     return '\n'.join(results)
+
+
+def cmd_batch_order(group_id, user_id, user_name, text):
+    """批次下單：Name|item×qty、item×qty 或 item×qty、item×qty"""
+    active = get_active_buy(group_id)
+    if not active:
+        return None
+
+    buy_id = active[0]
+    items = get_items(buy_id)
+    if not items:
+        return None
+
+    # 判斷是否有代訂人（以 | 分隔）
+    if '|' in text:
+        parts = text.split('|', 1)
+        order_name = parts[0].strip()
+        items_text = parts[1].strip()
+        registered_by = user_name
+    else:
+        order_name = user_name or "（未知）"
+        items_text = text.strip()
+        registered_by = None
+
+    # 解析每個品項：以 、 或 , 分隔
+    item_entries = re.split(r'[、,]\s*', items_text)
+
+    results = []
+    for entry in item_entries:
+        entry = entry.strip()
+        if not entry:
+            continue
+
+        # 解析 item_name×qty 或 item_name x qty
+        m = re.match(r'^(.+?)\s*[×xX]\s*(\d+)\s*[份個包組盒袋條]?\s*$', entry)
+        if m:
+            search_name = m.group(1).strip()
+            qty = int(m.group(2))
+        else:
+            # 沒有數量標記 → 預設 1 份
+            search_name = entry.strip()
+            qty = 1
+
+        if qty < 1:
+            continue
+
+        # 在品項中找匹配（子字串比對）
+        matched_item = None
+        for item in items:
+            item_name = item[3]  # name field
+            price_info = item[4] or ""
+            if search_name in item_name or search_name in price_info:
+                matched_item = item
+                break
+
+        if not matched_item:
+            results.append(f"⚠️ 找不到品項「{search_name}」")
+            continue
+
+        item_num = matched_item[2]
+
+        # 透過 cmd_order 下單
+        if registered_by:
+            order_text = f"+{item_num} {order_name} {qty}"
+        else:
+            order_text = f"+{item_num} {qty}"
+
+        order_result = cmd_order(group_id, user_id, user_name, order_text)
+        if order_result:
+            results.append(order_result)
+
+    return '\n'.join(results) if results else None
 
 
 def cmd_cancel_order(group_id, user_id, user_name, text):
@@ -1139,6 +1213,10 @@ def handle_message(event):
     # ── 團購說明（所有人可用）
     elif text in ("團購說明", "操作說明", "說明"):
         reply = HELP_TEXT
+
+    # ── 批次下單（品名×數量、品名×數量 或 Name|品名×數量、品名×數量）
+    elif re.search(r'[\u4e00-\u9fff\u3400-\u4dbf）\)]\s*[×xX]\s*\d', text):
+        reply = cmd_batch_order(gid, uid, lazy_name(), text)
 
     # ── AI 自然語言理解（放在所有指令判斷的最後）
     if reply is None and len(text) >= 2 and len(text) <= 200:
