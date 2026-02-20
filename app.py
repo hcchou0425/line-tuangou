@@ -552,7 +552,7 @@ def cmd_order_multi(group_id, user_id, user_name, text):
 
 
 def cmd_batch_order(group_id, user_id, user_name, text):
-    """批次下單：Name|item×qty、item×qty 或 item×qty、item×qty"""
+    """批次下單：Name|item×qty、item×qty 或 Name item×qty、... 或 item×qty、..."""
     active = get_active_buy(group_id)
     if not active:
         return None
@@ -560,6 +560,15 @@ def cmd_batch_order(group_id, user_id, user_name, text):
     buy_id = active[0]
     items = get_items(buy_id)
     if not items:
+        return None
+
+    def find_match(search):
+        """在品項中找匹配（子字串比對）"""
+        for item in items:
+            item_name = item[3]
+            price_info = item[4] or ""
+            if search in item_name or search in price_info:
+                return item
         return None
 
     # 判斷是否有代訂人（以 | 分隔）
@@ -577,6 +586,9 @@ def cmd_batch_order(group_id, user_id, user_name, text):
     item_entries = re.split(r'[、,]\s*', items_text)
 
     results = []
+    success_count = 0
+    detected_proxy = None  # 從第一個 entry 偵測到的代訂人名
+
     for entry in item_entries:
         entry = entry.strip()
         if not entry:
@@ -598,14 +610,26 @@ def cmd_batch_order(group_id, user_id, user_name, text):
         if qty < 1:
             continue
 
-        # 在品項中找匹配（子字串比對）
-        matched_item = None
-        for item in items:
-            item_name = item[3]  # name field
-            price_info = item[4] or ""
-            if search_name in item_name or search_name in price_info:
-                matched_item = item
-                break
+        # 在品項中找匹配
+        matched_item = find_match(search_name)
+
+        # 沒找到且沒有 | 分隔 → 嘗試移除前導詞作為代訂人名
+        # 例如「秋蘭 麻油猴頭菇」→ 代訂人=秋蘭，品名=麻油猴頭菇
+        proxy_name = None
+        if not matched_item and '|' not in text:
+            words = search_name.split()
+            for i in range(1, len(words)):
+                shorter = ''.join(words[i:])
+                matched_item = find_match(shorter)
+                if not matched_item:
+                    shorter = ' '.join(words[i:])
+                    matched_item = find_match(shorter)
+                if matched_item:
+                    proxy_name = ''.join(words[:i])
+                    break
+
+        if proxy_name:
+            detected_proxy = proxy_name
 
         if not matched_item:
             results.append(f"⚠️ 找不到品項「{search_name}」")
@@ -613,8 +637,11 @@ def cmd_batch_order(group_id, user_id, user_name, text):
 
         item_num = matched_item[2]
 
-        # 透過 cmd_order 下單
-        if registered_by:
+        # 決定下單用的名字
+        effective_proxy = proxy_name or detected_proxy
+        if effective_proxy and not registered_by:
+            order_text = f"+{item_num} {effective_proxy} {qty}"
+        elif registered_by:
             order_text = f"+{item_num} {order_name} {qty}"
         else:
             order_text = f"+{item_num} {qty}"
@@ -622,8 +649,12 @@ def cmd_batch_order(group_id, user_id, user_name, text):
         order_result = cmd_order(group_id, user_id, user_name, order_text)
         if order_result:
             results.append(order_result)
+            success_count += 1
 
-    return '\n'.join(results) if results else None
+    # 沒有任何成功的訂單 → 回傳 None，讓 NLU 接手
+    if success_count == 0:
+        return None
+    return '\n'.join(results)
 
 
 def cmd_cancel_order(group_id, user_id, user_name, text):
@@ -1217,10 +1248,10 @@ def handle_message(event):
     elif text in ("團購說明", "操作說明", "說明"):
         reply = HELP_TEXT
 
-    # ── 批次下單（品名×數量、品名數量 或 Name|品名數量）
+    # ── 批次下單（品名×數量、品名數量、Name 品名數量 或 Name|品名數量）
     elif re.search(r'[\u4e00-\u9fff\u3400-\u4dbf）\)]\s*[×xX*]\s*\d', text) or \
          (('|' in text or '、' in text) and re.search(r'[\u4e00-\u9fff\u3400-\u4dbf]\d', text)) or \
-         re.match(r'^[\u4e00-\u9fff\u3400-\u4dbf]{2,}\s*\d+\s*[份個包組盒袋條]?\s*$', text):
+         re.match(r'^[\u4e00-\u9fff\u3400-\u4dbf][\u4e00-\u9fff\u3400-\u4dbf\s]*\d+\s*[份個包組盒袋條]?\s*$', text):
         reply = cmd_batch_order(gid, uid, lazy_name(), text)
 
     # ── AI 自然語言理解（放在所有指令判斷的最後）
