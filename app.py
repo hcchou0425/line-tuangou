@@ -618,7 +618,7 @@ def cmd_open(group_id, user_id, user_name, text):
     return '\n'.join(lines)
 
 
-def cmd_order(group_id, user_id, user_name, text, target_buy=None):
+def cmd_order(group_id, user_id, user_name, text, target_buy=None, skip_auto_close=False):
     """下單：+N / +N 數量 / +N 名字 / +N 名字 數量"""
     # 解析指令
     m = re.match(r'\+(\d+)(?:\s+(.*))?$', text)
@@ -715,10 +715,11 @@ def cmd_order(group_id, user_id, user_name, text, target_buy=None):
     else:
         result = f"✅ {label}{order_name}【{item_num}】{item_name} +{quantity}份（共 {total} 份）"
 
-    # 檢查自動結團
-    auto_close = check_auto_close(buy_id, group_id)
-    if auto_close:
-        result += auto_close
+    # 檢查自動結團（批次下單時由呼叫端統一處理）
+    if not skip_auto_close:
+        auto_close = check_auto_close(buy_id, group_id)
+        if auto_close:
+            result += auto_close
 
     return result
 
@@ -902,7 +903,7 @@ def cmd_batch_order(group_id, user_id, user_name, text):
         else:
             order_text = f"+{item_num} {qty}"
 
-        order_result = cmd_order(group_id, user_id, user_name, order_text, target_buy=matched_buy)
+        order_result = cmd_order(group_id, user_id, user_name, order_text, target_buy=matched_buy, skip_auto_close=True)
         if order_result:
             results.append(order_result)
             success_count += 1
@@ -911,6 +912,13 @@ def cmd_batch_order(group_id, user_id, user_name, text):
     # 沒有任何成功的訂單 → 回傳 None，讓 NLU 接手
     if success_count == 0:
         return None
+
+    # 批次下單完成後，統一檢查自動結團
+    for bid in affected_buys:
+        auto_close = check_auto_close(bid, group_id)
+        if auto_close:
+            results.append(auto_close)
+
     return '\n'.join(results)
 
 
