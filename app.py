@@ -583,7 +583,7 @@ def cmd_batch_order(group_id, user_id, user_name, text):
             continue
 
         # 解析 item_name×qty 或 item_name x qty
-        m = re.match(r'^(.+?)\s*[×xX]\s*(\d+)\s*[份個包組盒袋條]?\s*$', entry)
+        m = re.match(r'^(.+?)\s*[×xX*]\s*(\d+)\s*[份個包組盒袋條]?\s*$', entry)
         if m:
             search_name = m.group(1).strip()
             qty = int(m.group(2))
@@ -1215,7 +1215,7 @@ def handle_message(event):
         reply = HELP_TEXT
 
     # ── 批次下單（品名×數量、品名×數量 或 Name|品名×數量、品名×數量）
-    elif re.search(r'[\u4e00-\u9fff\u3400-\u4dbf）\)]\s*[×xX]\s*\d', text):
+    elif re.search(r'[\u4e00-\u9fff\u3400-\u4dbf）\)]\s*[×xX*]\s*\d', text):
         reply = cmd_batch_order(gid, uid, lazy_name(), text)
 
     # ── AI 自然語言理解（放在所有指令判斷的最後）
